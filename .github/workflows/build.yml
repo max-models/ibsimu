@@ -41,8 +41,8 @@ jobs:
 
       - name: Download and build GSL
         run: |
-          curl https://mirror.ibcp.fr/pub/gnu/gsl/${{ env.GSL_DIR }}.tar.gz  --output ${{ env.GSL_DIR }}.tar.gz
-          tar xvfz ${{ env.GSL_DIR }}.tar.gz
+          curl https://mirror.ibcp.fr/pub/gnu/gsl/$GSL_VERSION.tar.gz  --output $GSL_VERSION.tar.gz
+          tar xvfz $GSL_VERSION.tar.gz
 
       - name: Configure GSL build
         working-directory: ${{ env.GSL_DIR }}
