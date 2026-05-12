@@ -48,6 +48,13 @@ tests/*_vout.txt
 
 
 
-
+.DS_Store
+build/
+compile
+ibsimu.cpython-313-darwin.so
+*.egg-info/
+src/libibsimu-1.0.6dev.la
+src/stamp-h1
+test-driver
 
 
