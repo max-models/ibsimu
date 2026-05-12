@@ -11,10 +11,18 @@ class Pybind11Include:
 
 def get_pkg_config(args):
     try:
-        res = subprocess.check_output(['pkg-config'] + args).decode('utf-8').strip()
+        res = subprocess.check_output(['pkg-config'] + args,
+                                      stderr=subprocess.DEVNULL).decode('utf-8').strip()
         return res.split() if res else []
     except:
         return []
+
+def get_pkg_config_multi(flag, pkgs):
+    """Query each package individually, collecting flags, silently skipping missing ones."""
+    flags = []
+    for pkg in pkgs:
+        flags.extend(get_pkg_config([flag, pkg]))
+    return flags
 
 # IBSimu specific flags
 # Since we are building in-tree, we add src/ to includes
@@ -22,25 +30,33 @@ include_dirs = ['src', Pybind11Include()]
 library_dirs = ['src/.libs']
 libraries = ['ibsimu-1.0.6dev']
 
-# Add dependencies from pkg-config
-pkg_libs = get_pkg_config(['--libs', 'gtk+-3.0', 'gsl', 'libpng', 'cairo', 'freetype2', 'fontconfig'])
-# Extract library names from -l flags
+# These packages are required; GTK is optional (only needed for live display)
+required_pkgs = ['gsl', 'libpng', 'cairo', 'freetype2', 'fontconfig']
+optional_pkgs = ['gtk+-3.0']
+
+all_pkgs = required_pkgs + optional_pkgs
+
+# Add dependencies from pkg-config (query individually so missing ones don't kill the rest)
+pkg_libs = get_pkg_config_multi('--libs', all_pkgs)
 for arg in pkg_libs:
     if arg.startswith('-l'):
         libraries.append(arg[2:])
     elif arg.startswith('-L'):
         library_dirs.append(arg[2:])
 
-pkg_cflags = get_pkg_config(['--cflags', 'gtk+-3.0', 'gsl', 'libpng', 'cairo', 'freetype2', 'fontconfig'])
-extra_compile_args = ['-std=c++11']
+pkg_cflags = get_pkg_config_multi('--cflags', all_pkgs)
+extra_compile_args = ['-std=c++14']
 for arg in pkg_cflags:
     if arg.startswith('-I'):
         include_dirs.append(arg[2:])
     else:
         extra_compile_args.append(arg)
 
-# Add other libraries manually if needed
-libraries.extend(['rt', 'umfpack', 'amd', 'blas', 'z'])
+# Add other libraries manually if needed (skip platform-specific ones missing on macOS)
+extra_libs = ['z']
+if sys.platform != 'darwin':
+    extra_libs.insert(0, 'rt')
+libraries.extend(extra_libs)
 
 ext_modules = [
     Extension(
