@@ -638,6 +638,9 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("get1",     [](const MeshVectorField &f, uint32_t i){ return f(i); })
         .def("get2",     [](const MeshVectorField &f, uint32_t i, uint32_t j){ return f(i,j); })
         .def("get3",     [](const MeshVectorField &f, uint32_t i, uint32_t j, uint32_t k){ return f(i,j,k); })
+        .def("set1",     (void (MeshVectorField::*)(int32_t, const Vec3D &)) &MeshVectorField::set)
+        .def("set2",     (void (MeshVectorField::*)(int32_t, int32_t, const Vec3D &)) &MeshVectorField::set)
+        .def("set3",     (void (MeshVectorField::*)(int32_t, int32_t, int32_t, const Vec3D &)) &MeshVectorField::set)
         .def("set_extrapolation", [](MeshVectorField &f, py::list ext){
             field_extrpl_e e[6]; list_to_extrpl(ext, e); f.set_extrapolation(e);
         })
