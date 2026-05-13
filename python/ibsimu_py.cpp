@@ -17,6 +17,9 @@
 #include "func_solid.hpp"
 #include "stl_solid.hpp"
 #include "dxf_solid.hpp"
+#ifdef CSG
+#include "csgobject_solid.hpp"
+#endif
 #include "mydxffile.hpp"
 #include "transformation.hpp"
 #include "epot_solver.hpp"
@@ -67,6 +70,36 @@ public:
     }
     virtual void debug_print(std::ostream &os) const override { os << "PySolid"; }
     virtual void save(std::ostream &s) const override {}
+};
+
+// ---------------------------------------------------------------------------
+// Trampoline: CallbackFunctorD_3D subclassable from Python
+// ---------------------------------------------------------------------------
+class PyCallbackFunctorD_3D : public CallbackFunctorD_3D {
+public:
+    double operator()(double x, double y, double z) const override {
+        PYBIND11_OVERRIDE_PURE(double, CallbackFunctorD_3D, operator(), x, y, z);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Trampoline: CallbackFunctorB_3D subclassable from Python
+// ---------------------------------------------------------------------------
+class PyCallbackFunctorB_3D : public CallbackFunctorB_3D {
+public:
+    bool operator()(double x, double y, double z) const override {
+        PYBIND11_OVERRIDE_PURE(bool, CallbackFunctorB_3D, operator(), x, y, z);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Trampoline: CallbackFunctorD_D subclassable from Python
+// ---------------------------------------------------------------------------
+class PyCallbackFunctorD_D : public CallbackFunctorD_D {
+public:
+    double operator()(double x) const override {
+        PYBIND11_OVERRIDE_PURE(double, CallbackFunctorD_D, operator(), x);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -556,6 +589,13 @@ PYBIND11_MODULE(ibsimu, m) {
             else throw std::runtime_error("Unknown mapping name: " + mname);
         });
 
+#ifdef CSG
+    py::class_<CSGObject>(m, "CSGObject");
+    py::class_<CSGObjectSolid, Solid>(m, "CSGObjectSolid")
+        .def(py::init<CSGObject*>())
+        .def("inside", &CSGObjectSolid::inside);
+#endif
+
     // -----------------------------------------------------------------------
     // Field base classes
     // -----------------------------------------------------------------------
@@ -697,21 +737,36 @@ PYBIND11_MODULE(ibsimu, m) {
         });
 
     // -----------------------------------------------------------------------
-    // InitialPlasma (CallbackFunctorB_V subclass)
+    // Callbacks / Functors
     // -----------------------------------------------------------------------
+    py::class_<CallbackFunctor>(m, "CallbackFunctor");
+
+    py::class_<CallbackFunctorD_3D, PyCallbackFunctorD_3D>(m, "CallbackFunctorD_3D")
+        .def(py::init<>())
+        .def("__call__", [](const CallbackFunctorD_3D &f, double x, double y, double z){
+            return f(x, y, z);
+        });
+
+    py::class_<CallbackFunctorD_V, PyCallbackFunctorD_V>(m, "CallbackFunctorD_V")
+        .def(py::init<>())
+        .def("__call__", [](const CallbackFunctorD_V &f, const Vec3D &x){ return f(x); });
+
+    py::class_<CallbackFunctorB_3D, PyCallbackFunctorB_3D>(m, "CallbackFunctorB_3D")
+        .def(py::init<>())
+        .def("__call__", [](const CallbackFunctorB_3D &f, double x, double y, double z){
+            return f(x, y, z);
+        });
+
     py::class_<CallbackFunctorB_V, PyCallbackFunctorB_V>(m, "CallbackFunctorB_V")
         .def(py::init<>())
         .def("__call__", [](const CallbackFunctorB_V &f, const Vec3D &x){ return f(x); });
 
+    py::class_<CallbackFunctorD_D, PyCallbackFunctorD_D>(m, "CallbackFunctorD_D")
+        .def(py::init<>())
+        .def("__call__", [](const CallbackFunctorD_D &f, double x){ return f(x); });
+
     py::class_<InitialPlasma, CallbackFunctorB_V>(m, "InitialPlasma")
         .def(py::init<coordinate_axis_e, double>());
-
-    // -----------------------------------------------------------------------
-    // CallbackFunctorD_V (for bfield suppression)
-    // -----------------------------------------------------------------------
-    py::class_<CallbackFunctorD_V, PyCallbackFunctorD_V>(m, "CallbackFunctorD_V")
-        .def(py::init<>())
-        .def("__call__", [](const CallbackFunctorD_V &f, const Vec3D &x){ return f(x); });
 
     py::class_<PPlasmaBfieldSuppression, CallbackFunctorD_V>(m, "PPlasmaBfieldSuppression")
         .def(py::init<const MeshScalarField &, double>());
@@ -1365,13 +1420,23 @@ PYBIND11_MODULE(ibsimu, m) {
 
     py::class_<GeomPlotter, Plotter>(m, "GeomPlotter")
         .def(py::init<const Geometry &>())
-        .def("set_epot",              &GeomPlotter::set_epot)
-        .def("set_particle_database", &GeomPlotter::set_particle_database)
-        .def("set_trajdens",          &GeomPlotter::set_trajdens)
+        .def("set_epot",              &GeomPlotter::set_epot, py::keep_alive<1, 2>())
+        .def("set_bfield",            &GeomPlotter::set_bfield, py::keep_alive<1, 2>())
+        .def("set_efield",            &GeomPlotter::set_efield, py::keep_alive<1, 2>())
+        .def("set_scharge",           &GeomPlotter::set_scharge, py::keep_alive<1, 2>())
+        .def("set_trajdens",          &GeomPlotter::set_trajdens, py::keep_alive<1, 2>())
+        .def("set_particle_database", &GeomPlotter::set_particle_database, py::keep_alive<1, 2>())
+        .def("set_particledatabase",  &GeomPlotter::set_particledatabase, py::keep_alive<1, 2>())
         .def("set_eqlines_manual",    &GeomPlotter::set_eqlines_manual)
+        .def("set_eqlines_auto",      &GeomPlotter::set_eqlines_auto)
+        .def("enable_colormap_legend", &GeomPlotter::enable_colormap_legend)
         .def("set_particle_div",      [](GeomPlotter &g, uint32_t div, uint32_t offset){
             g.set_particle_div(div, offset);
         }, py::arg("div"), py::arg("offset") = 0)
+        .def("set_qm_discretation",   &GeomPlotter::set_qm_discretation)
+        .def("set_mesh",              &GeomPlotter::set_mesh)
+        .def("set_view",              &GeomPlotter::set_view, py::arg("view"), py::arg("level") = -1)
+        .def("set_view_si",           &GeomPlotter::set_view_si)
         .def("set_fieldgraph_plot",   &GeomPlotter::set_fieldgraph_plot)
         .def("fieldgraph", (FieldGraph* (GeomPlotter::*)()) &GeomPlotter::fieldgraph,
              py::return_value_policy::reference_internal);

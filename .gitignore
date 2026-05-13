@@ -56,5 +56,5 @@ ibsimu.cpython-313-darwin.so
 src/libibsimu-1.0.6dev.la
 src/stamp-h1
 test-driver
-
+*.png
 
