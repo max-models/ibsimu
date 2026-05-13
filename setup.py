@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 
@@ -36,6 +37,13 @@ def get_pkg_config_multi(flag, pkgs):
 include_dirs = ["src", Pybind11Include()]
 library_dirs = ["src/.libs"]
 libraries = ["ibsimu-1.0.6dev"]
+extra_objects = []
+
+if sys.platform == "darwin":
+    static_lib = os.path.abspath("src/.libs/libibsimu-1.0.6dev.a")
+    if os.path.exists(static_lib):
+        libraries = []
+        extra_objects = [static_lib]
 
 # These packages are required; GTK is optional (only needed for live display)
 required_pkgs = ["gsl", "libpng", "cairo", "freetype2", "fontconfig"]
@@ -72,6 +80,7 @@ ext_modules = [
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         libraries=libraries,
+        extra_objects=extra_objects,
         extra_compile_args=extra_compile_args,
         language="c++",
     ),
