@@ -1,5 +1,4 @@
 import ibsimu
-import math
 
 
 def solid1(x, y, z):

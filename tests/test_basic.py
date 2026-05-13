@@ -1,5 +1,4 @@
 import ibsimu
-import numpy as np
 
 
 def test_basic_simulation():
