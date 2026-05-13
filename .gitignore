@@ -50,11 +50,18 @@ tests/*_vout.txt
 
 .DS_Store
 build/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 compile
-ibsimu.cpython-313-darwin.so
+ibsimu.cpython-*.so
 *.egg-info/
-src/libibsimu-1.0.6dev.la
+src/libibsimu-*.la
 src/stamp-h1
 test-driver
 *.png
+*.dat
+*.txt
 
