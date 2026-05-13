@@ -1,16 +1,25 @@
 import ibsimu
 import math
 
+
 def solid1(x, y, z):
-    return (x <= 2.0e-3 and y >= 0.5e-3 and y >= 2.0*x - 1.0e-3 and
-            (x >= 0.5e-3 or y >= 1.5e-3))
+    return (
+        x <= 2.0e-3
+        and y >= 0.5e-3
+        and y >= 2.0 * x - 1.0e-3
+        and (x >= 0.5e-3 or y >= 1.5e-3)
+    )
+
 
 def solid2(x, y, z):
-    return (x >= 10.0e-3 and y >= 1.5e-3 and y >= 12.0e-3 - x)
+    return x >= 10.0e-3 and y >= 1.5e-3 and y >= 12.0e-3 - x
+
 
 def test():
     # Geometry
-    geom = ibsimu.Geometry(ibsimu.MODE_2D, ibsimu.Int3D(76, 45, 1), ibsimu.Vec3D(0, 0, 0), 1.6e-4)
+    geom = ibsimu.Geometry(
+        ibsimu.MODE_2D, ibsimu.Int3D(76, 45, 1), ibsimu.Vec3D(0, 0, 0), 1.6e-4
+    )
 
     s1 = ibsimu.FuncSolid(solid1)
     geom.set_solid(7, s1)
@@ -36,9 +45,16 @@ def test():
     efield = ibsimu.EpotEfield(epot)
 
     # efield.set_extrapolation([FIELD_EXTRAPOLATE, FIELD_EXTRAPOLATE, FIELD_SYMMETRIC_POTENTIAL, FIELD_EXTRAPOLATE, FIELD_EXTRAPOLATE, FIELD_EXTRAPOLATE])
-    efield.set_extrapolation([ibsimu.FIELD_EXTRAPOLATE, ibsimu.FIELD_EXTRAPOLATE, 
-                              ibsimu.FIELD_SYMMETRIC_POTENTIAL, ibsimu.FIELD_EXTRAPOLATE,
-                              ibsimu.FIELD_EXTRAPOLATE, ibsimu.FIELD_EXTRAPOLATE])
+    efield.set_extrapolation(
+        [
+            ibsimu.FIELD_EXTRAPOLATE,
+            ibsimu.FIELD_EXTRAPOLATE,
+            ibsimu.FIELD_SYMMETRIC_POTENTIAL,
+            ibsimu.FIELD_EXTRAPOLATE,
+            ibsimu.FIELD_EXTRAPOLATE,
+            ibsimu.FIELD_EXTRAPOLATE,
+        ]
+    )
 
     pdb = ibsimu.ParticleDataBase2D(geom)
     pdb.set_mirror([False, False, True, False, False, False])
@@ -59,23 +75,34 @@ def test():
         efield.recalculate()
 
         pdb.clear()
-        pdb.add_2d_beam_with_energy(50000, 600.0, 1.0, 1.0, 
-                                     5.0, 0.0, 0.5, 
-                                     0.0, 0.0, 
-                                     0.0, 1.5e-3)
+        pdb.add_2d_beam_with_energy(
+            50000, 600.0, 1.0, 1.0, 5.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.5e-3
+        )
         pdb.iterate_trajectories(scharge, efield, bfield)
 
-        pp = ibsimu.ParticleDiagPlotter(geom, pdb, ibsimu.AXIS_X, 11.90e-3, 
-                                        ibsimu.PARTICLE_DIAG_PLOT_SCATTER, 
-                                        ibsimu.DIAG_Y, ibsimu.DIAG_YP)
+        pp = ibsimu.ParticleDiagPlotter(
+            geom,
+            pdb,
+            ibsimu.AXIS_X,
+            11.90e-3,
+            ibsimu.PARTICLE_DIAG_PLOT_SCATTER,
+            ibsimu.DIAG_Y,
+            ibsimu.DIAG_YP,
+        )
         emit = pp.calculate_emittance()
         conv.evaluate_iteration()
 
     conv.print_history("plasma2d_conv_py.dat")
 
-    pplotter1 = ibsimu.ParticleDiagPlotter(geom, pdb, ibsimu.AXIS_X, 1e-6, 
-                                           ibsimu.PARTICLE_DIAG_PLOT_HISTO2D, 
-                                           ibsimu.DIAG_Y, ibsimu.DIAG_YP)
+    pplotter1 = ibsimu.ParticleDiagPlotter(
+        geom,
+        pdb,
+        ibsimu.AXIS_X,
+        1e-6,
+        ibsimu.PARTICLE_DIAG_PLOT_HISTO2D,
+        ibsimu.DIAG_Y,
+        ibsimu.DIAG_YP,
+    )
     pplotter1.set_font_size(20)
     pplotter1.set_size(800, 600)
     pplotter1.plot_png("plasma2d_emit1_py.png")
@@ -93,6 +120,7 @@ def test():
     gplotter.set_fieldgraph_plot(ibsimu.FIELD_TRAJDENS)
     gplotter.fieldgraph().set_zscale(ibsimu.ZSCALE_RELLOG)
     gplotter.plot_png("plasma2d_py.png")
+
 
 if __name__ == "__main__":
     test()

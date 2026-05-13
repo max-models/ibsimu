@@ -84,7 +84,7 @@ def run_vlasov2d():
             1000, 50.0, 1.0, 1.0, 3000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.012
         )
         pdb.iterate_trajectories(scharge, efield, bfield)
-        print(f"  Iteration {i+1} complete")
+        print(f"  Iteration {i + 1} complete")
 
     # 5. Extraction at x = 115mm
     tdata_exit = ibsimu.TrajectoryDiagnosticData([ibsimu.DIAG_Y, ibsimu.DIAG_YP])
