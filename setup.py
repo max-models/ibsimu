@@ -19,7 +19,7 @@ def get_pkg_config(args):
             .strip()
         )
         return res.split() if res else []
-    except:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return []
 
 

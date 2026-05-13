@@ -40,4 +40,4 @@ def test_basic_simulation():
 
 
 if __name__ == "__main__":
-    smoke_test()
+    test_basic_simulation()
