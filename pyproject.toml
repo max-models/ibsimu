@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ibsimu"
+version = "1.0.6"
+authors = [
+    { name = "Taneli Kalvas", email = "taneli.kalvas@jyu.fi" },
+]
+description = "Python wrapper for IBSimu"
+readme = "README"
+requires-python = ">=3.8"
+dependencies = [
+    "pybind11",
+    "numpy",
+    "matplotlib",
+    "pyvista",
+    "scipy",
+    "ruff",
+    "pytest",
+]
+
+[tool.setuptools]
+py-modules = []
