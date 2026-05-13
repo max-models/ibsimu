@@ -27,6 +27,9 @@
 #include "epot_mgsolver.hpp"
 #include "epot_matrixsolver.hpp"
 #include "epot_bicgstabsolver.hpp"
+#ifdef HAVE_LIBUMFPACK
+#include "epot_umfpacksolver.hpp"
+#endif
 #include "epot_field.hpp"
 #include "epot_efield.hpp"
 #include "scalarfield.hpp"
