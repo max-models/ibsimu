@@ -1,6 +1,7 @@
-import sys
 import subprocess
-from setuptools import setup, Extension
+import sys
+
+from setuptools import Extension, setup
 
 
 class Pybind11Include:

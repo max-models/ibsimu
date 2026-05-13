@@ -2,9 +2,9 @@
 # Copyright 2008 Marcus D. Hanwell <marcus@cryos.org>
 # Distributed under the terms of the GNU General Public License v2 or later
 
-import string
-import re
 import os
+import re
+import string
 
 # Execute git log with the desired command line options.
 fin = os.popen("git log --summary --stat --no-merges --date=short", "r")
@@ -53,7 +53,7 @@ for line in fin:
     elif re.search("Signed-off-by", line) >= 0:
         continue
     # Extract the actual commit message for this commit
-    elif authorFound & dateFound & messageFound == False:
+    elif not authorFound & dateFound & messageFound:
         # Find the commit message if we can
         if len(line) == 1:
             if messageNL:
