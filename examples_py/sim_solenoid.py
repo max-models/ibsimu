@@ -1,7 +1,6 @@
+import ibsimu
 import matplotlib.pyplot as plt
 import numpy as np
-
-import ibsimu
 
 
 def run_solenoid():

@@ -1,9 +1,8 @@
 import math
 
+import ibsimu
 import numpy as np
 import pyvista as pv
-
-import ibsimu
 
 
 def run_solenoid_3d_viz():

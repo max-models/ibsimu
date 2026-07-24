@@ -47,10 +47,7 @@ for line in fin:
         date = date[0 : len(date) - 1]
         dateFound = True
     # The svn-id lines are ignored
-    elif re.match(" git-svn-id:", line) >= 0:
-        continue
-    # The sign off line is ignored too
-    elif re.search("Signed-off-by", line) >= 0:
+    elif re.match(" git-svn-id:", line) >= 0 or re.search("Signed-off-by", line) >= 0:
         continue
     # Extract the actual commit message for this commit
     elif not authorFound & dateFound & messageFound:
@@ -73,7 +70,7 @@ for line in fin:
         continue
     # Collect the files for this commit. FIXME: Still need to add +/- to files
     elif authorFound & dateFound & messageFound:
-        fileList = re.split(" \| ", line, 2)
+        fileList = re.split(r" \| ", line, 2)
         if len(fileList) > 1:
             if len(files) > 0:
                 files = files + ", " + fileList[0].strip()
