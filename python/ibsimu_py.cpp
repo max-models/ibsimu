@@ -500,7 +500,15 @@ PYBIND11_MODULE(ibsimu, m) {
     // -----------------------------------------------------------------------
     py::class_<Geometry, Mesh>(m, "Geometry")
         .def(py::init<geom_mode_e, Int3D, Vec3D, double>())
-        .def("set_solid",   &Geometry::set_solid)
+        // Geometry takes ownership of the solid (it deletes the old one when a
+        // solid number is redefined), so the Python side must stop owning it.
+        // keep_alive additionally ties the wrapper's lifetime to the geometry,
+        // which matters for FuncSolid, where the wrapper holds the callable.
+        .def("set_solid",   [](Geometry &g, uint32_t n, py::object solid){
+            const Solid *s = solid.cast<const Solid *>();
+            reinterpret_cast<py::detail::instance *>(solid.ptr())->owned = false;
+            g.set_solid(n, s);
+        }, py::keep_alive<1, 3>())
         .def("get_solid",   &Geometry::get_solid, py::return_value_policy::reference)
         .def("set_boundary",&Geometry::set_boundary)
         .def("get_boundary",&Geometry::get_boundary)

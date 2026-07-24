@@ -1,7 +1,6 @@
+import ibsimu
 import matplotlib.pyplot as plt
 import numpy as np
-
-import ibsimu
 
 
 def run_vlasov2d():
@@ -25,13 +24,9 @@ def run_vlasov2d():
     def solid3_func(x, y, z):
         return x >= 0.06 and y >= 0.03 and y >= (0.07 - 0.5 * x)
 
-    # Keep references to solids to avoid GC issues
-    s1 = ibsimu.FuncSolid(solid1_func)
-    geom.set_solid(7, s1)
-    s2 = ibsimu.FuncSolid(solid2_func)
-    geom.set_solid(8, s2)
-    s3 = ibsimu.FuncSolid(solid3_func)
-    geom.set_solid(9, s3)
+    geom.set_solid(7, ibsimu.FuncSolid(solid1_func))
+    geom.set_solid(8, ibsimu.FuncSolid(solid2_func))
+    geom.set_solid(9, ibsimu.FuncSolid(solid3_func))
 
     # Boundaries
     geom.set_boundary(1, ibsimu.Bound(ibsimu.BOUND_DIRICHLET, -3000.0))
