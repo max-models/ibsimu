@@ -1,121 +1,108 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # Copyright 2008 Marcus D. Hanwell <marcus@cryos.org>
 # Distributed under the terms of the GNU General Public License v2 or later
 
-import os
 import re
-import string
+import subprocess
+import textwrap
 
-# Set up the loop variables in order to locate the blocks we want
-authorFound = False
-dateFound = False
-messageFound = False
-filesFound = False
-message = ""
-messageNL = False
-files = ""
-prevAuthorLine = ""
+# Message lines that carry no information for the ChangeLog.
+IGNORED_MESSAGE_RE = re.compile(r"^(git-svn-id:|Signed-off-by:)")
 
-# Execute git log with the desired command line options, and create a
-# ChangeLog file in the current directory.
-with os.popen("git log --summary --stat --no-merges --date=short", "r") as fin, open(
-    "ChangeLog", "w"
-) as fout:
-    # The main part of the loop
-    for line in fin:
+# A line of --stat output, e.g. "  src/geometry.cpp | 12 ++++++------".
+STAT_RE = re.compile(r"^\s+(?P<file>.+?)\s+\|\s+\d+")
+
+# The summary line that ends the --stat block, e.g. " 3 files changed, ...".
+STAT_SUMMARY_RE = re.compile(r"^\s+\d+ files? changed")
+
+# Width the commit entries are wrapped to.
+WIDTH = 78
+
+
+def read_git_log():
+    """Return the git log output the ChangeLog is generated from."""
+    result = subprocess.run(
+        ["git", "log", "--summary", "--stat", "--no-merges", "--date=short"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def parse_commits(log):
+    """Yield (date, author, message, files) tuples, newest commit first.
+
+    Commits that touch no files are skipped, as they produce no entry.
+    """
+    date = author = None
+    message_lines = []
+    files = []
+    in_message = False
+
+    def entry():
+        if date and author and files:
+            return (date, author, " ".join(message_lines), files)
+        return None
+
+    for line in log.splitlines():
         # The commit line marks the start of a new commit object.
-        if string.find(line, "commit") >= 0:
-            # Start all over again...
-            authorFound = False
-            dateFound = False
-            messageFound = False
-            messageNL = False
-            message = ""
-            filesFound = False
-            files = ""
+        if line.startswith("commit "):
+            commit = entry()
+            if commit:
+                yield commit
+            date = author = None
+            message_lines = []
+            files = []
+            in_message = False
+        elif line.startswith("Author:"):
+            author = line.split(":", 1)[1].strip()
+        elif line.startswith("Date:"):
+            date = line.split(":", 1)[1].strip()
+        elif line.startswith("    "):
+            # The commit message is the part indented by four spaces.
+            in_message = True
+            text = line.strip()
+            if not IGNORED_MESSAGE_RE.match(text):
+                message_lines.append(text)
+        elif STAT_SUMMARY_RE.match(line):
             continue
-        # Match the author line and extract the part we want
-        elif re.match("Author:", line) >= 0:
-            authorList = re.split(": ", line, 1)
-            author = authorList[1]
-            author = author[0 : len(author) - 1]
-            authorFound = True
-        # Match the date line
-        elif re.match("Date:", line) >= 0:
-            dateList = re.split(": ", line, 1)
-            date = dateList[1]
-            date = date[0 : len(date) - 1]
-            dateFound = True
-        # The svn-id lines are ignored
-        elif (
-            re.match(" git-svn-id:", line) >= 0 or re.search("Signed-off-by", line) >= 0
-        ):
-            continue
-        # Extract the actual commit message for this commit
-        elif not authorFound & dateFound & messageFound:
-            # Find the commit message if we can
-            if len(line) == 1:
-                if messageNL:
-                    messageFound = True
-                else:
-                    messageNL = True
-            elif len(line) == 4:
-                messageFound = True
-            else:
-                if len(message) == 0:
-                    message = message + line.strip()
-                else:
-                    message = message + " " + line.strip()
-        # If this line is hit all of the files have been stored for this commit
-        elif re.search("files changed", line) >= 0:
-            filesFound = True
-            continue
-        # Collect the files for this commit. FIXME: Still need to add +/- to files
-        elif authorFound & dateFound & messageFound:
-            fileList = re.split(r" \| ", line, 2)
-            if len(fileList) > 1:
-                if len(files) > 0:
-                    files = files + ", " + fileList[0].strip()
-                else:
-                    files = fileList[0].strip()
-        # All of the parts of the commit have been found - write out the entry
-        if authorFound & dateFound & messageFound & filesFound:
-            # First the author line, only outputted if it is the first for that
-            # author on this day
-            authorLine = date + " " + author
-            if len(prevAuthorLine) == 0:
-                fout.write(authorLine + "\n")
-            elif authorLine == prevAuthorLine:
-                pass
-            else:
-                fout.write("\n" + authorLine + "\n")
+        elif in_message:
+            # Collect the files of this commit from the --stat block.
+            # FIXME: Still need to add +/- to files
+            match = STAT_RE.match(line)
+            if match:
+                files.append(match.group("file").strip())
 
-            # Assemble the actual commit message line(s) and limit the line length
-            # to 80 characters.
-            commitLine = "* " + files + ": " + message
-            i = 0
-            commit = ""
-            while i < len(commitLine):
-                if len(commitLine) < i + 78:
-                    commit = commit + "\n " + commitLine[i : len(commitLine)]
-                    break
-                index = commitLine.rfind(" ", i, i + 78)
-                if index > i:
-                    commit = commit + "\n " + commitLine[i:index]
-                    i = index + 1
-                else:
-                    commit = commit + "\n " + commitLine[i:78]
-                    i = i + 79
+    commit = entry()
+    if commit:
+        yield commit
 
-            # Write out the commit line
-            fout.write(commit + "\n")
 
-            # Now reset all the variables ready for a new commit block.
-            authorFound = False
-            dateFound = False
-            messageFound = False
-            messageNL = False
-            message = ""
-            filesFound = False
-            files = ""
-            prevAuthorLine = authorLine
+def write_changelog(commits, out):
+    prev_author_line = ""
+    for date, author, message, files in commits:
+        # The author line is only written if it is the first one for that
+        # author on this day.
+        author_line = date + " " + author
+        if not prev_author_line:
+            out.write(author_line + "\n")
+        elif author_line != prev_author_line:
+            out.write("\n" + author_line + "\n")
+
+        # Assemble the actual commit message line(s) and limit the line length.
+        entry = "* " + ", ".join(files) + ": " + message
+        for wrapped in textwrap.wrap(entry, width=WIDTH):
+            out.write(" " + wrapped + "\n")
+
+        prev_author_line = author_line
+
+
+def main():
+    # Create a ChangeLog file in the current directory.
+    with open("ChangeLog", "w") as fout:
+        write_changelog(parse_commits(read_git_log()), fout)
+
+
+if __name__ == "__main__":
+    main()

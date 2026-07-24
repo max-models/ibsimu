@@ -117,7 +117,9 @@ def run_optimization():
     plt.plot(voltages, np.array(radii) * 1000, "bo-")
     if v_goal is not None:
         plt.axhline(R_GOAL * 1000, color="0.5", linestyle=":", label="Target radius")
-        plt.axvline(v_goal, color="r", linestyle="--", label=f"Solution: {v_goal:.0f} V")
+        plt.axvline(
+            v_goal, color="r", linestyle="--", label=f"Solution: {v_goal:.0f} V"
+        )
         plt.legend()
     plt.xlabel("Lens Voltage [V]")
     plt.ylabel(f"RMS Beam Radius at x = {X_TARGET * 1000:.0f} mm [mm]")
