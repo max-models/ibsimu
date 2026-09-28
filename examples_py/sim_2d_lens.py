@@ -101,14 +101,10 @@ def run_simulation():
 
     # 6.2 Potential color plot
     print("Extracting potential and field for plotting...")
-    nx, ny = geom.size(0), geom.size(1)
-    pot_map = np.zeros((ny, nx))
-    ef_map = np.zeros((ny, nx))
-    for j in range(ny):
-        for i in range(nx):
-            pot_map[j, i] = epot.get3(i, j, 0)
-            # Sample E-field at nodes
-            ef_map[j, i] = efield(ibsimu.Vec3D(i * h, j * h, 0)).norm2()
+    # Node data as (nx, n{y|r}) arrays; transpose for imshow's (rows, cols)
+    pot_map = epot.numpy().T
+    xs, ys = geom.node_coordinates()
+    ef_map = np.array([[efield(ibsimu.Vec3D(x, y, 0)).norm2() for x in xs] for y in ys])
 
     plt.subplot(3, 1, 2)
     ext = [

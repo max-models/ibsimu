@@ -97,10 +97,8 @@ def run_vlasov2d():
     # 6.1 Potential
     plt.subplot(4, 1, 1)
     nx, ny = geom.size(0), geom.size(1)
-    pot_map = np.zeros((ny, nx))
-    for j in range(ny):
-        for i in range(nx):
-            pot_map[j, i] = epot.get3(i, j, 0)
+    # Node data as (nx, n{y|r}) arrays; transpose for imshow's (rows, cols)
+    pot_map = epot.numpy().T
     im1 = plt.imshow(pot_map, extent=mesh_ext, origin="lower", cmap="viridis")
     plt.colorbar(im1, label="Potential [V]")
     plt.title("Vlasov2D Tutorial: Electric Potential")
@@ -129,12 +127,8 @@ def run_vlasov2d():
 
     # Plot trajectories (every 20th)
     for i in range(0, pdb.size(), 20):
-        p = pdb.particle(i)
-        tx, ty = [], []
-        for j in range(p.traj_size()):
-            pt = p.traj(j)
-            tx.append(pt.x() * 1000)
-            ty.append(pt.y() * 1000)
+        traj = pdb.particle(i).trajectory() * 1000  # mm
+        tx, ty = traj[:, ibsimu.PARTICLE_X], traj[:, ibsimu.PARTICLE_Y]
         plt.plot(tx, ty, color="blue", alpha=0.4, linewidth=0.5)
 
     plt.xlim(mesh_ext[0], mesh_ext[1])

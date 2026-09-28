@@ -68,11 +68,8 @@ def run_solenoid():
 
     plt.subplot(2, 1, 2)
     for i in range(0, pdb.size(), 5):
-        p = pdb.particle(i)
-        tx, tr = [], []
-        for j in range(p.traj_size()):
-            tx.append(p.traj(j).x() * 1000)
-            tr.append(p.traj(j).r() * 1000)
+        traj = pdb.particle(i).trajectory() * 1000  # mm
+        tx, tr = traj[:, ibsimu.PARTICLE_X], traj[:, ibsimu.PARTICLE_R]
         plt.plot(tx, tr, "b-", alpha=0.5)
         plt.plot(tx, [-r for r in tr], "b-", alpha=0.5)
 

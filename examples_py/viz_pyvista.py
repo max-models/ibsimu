@@ -1,5 +1,4 @@
 import ibsimu
-import numpy as np
 import pyvista as pv
 
 
@@ -81,13 +80,7 @@ def run_3d_quad_viz():
 
     # 4.1 Field Data
     nx, ny, nz = geom.size(0), geom.size(1), geom.size(2)
-    # Build a 3D numpy array for potential
-    # Note: MeshScalarField is (x, y, z)
-    pot_data = np.zeros((nx, ny, nz))
-    for k in range(nz):
-        for j in range(ny):
-            for i in range(nx):
-                pot_data[i, j, k] = epot.get3(i, j, k)
+    pot_data = epot.numpy()  # (nx, ny, nz) view of the node data
 
     # Create PyVista grid
     grid = pv.ImageData(
@@ -99,13 +92,10 @@ def run_3d_quad_viz():
     # 4.2 Trajectory Data
     trajectories = []
     for i in range(pdb.size()):
-        p = pdb.particle(i)
-        points = []
-        for j in range(p.traj_size()):
-            pt = p.traj(j)
-            points.append([pt.x(), pt.y(), pt.z()])
-        if points:
-            trajectories.append(pv.MultipleLines(np.array(points)))
+        traj = pdb.particle(i).trajectory()
+        points = traj[:, [ibsimu.PARTICLE_X, ibsimu.PARTICLE_Y, ibsimu.PARTICLE_Z]]
+        if len(points) > 1:
+            trajectories.append(pv.MultipleLines(points))
 
     # 5. Plotting
     plotter = pv.Plotter()

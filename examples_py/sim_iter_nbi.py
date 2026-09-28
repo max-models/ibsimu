@@ -101,10 +101,8 @@ def run_simulation():
     # 6.1 Potential
     plt.subplot(4, 1, 1)
     nx, nr = geom.size(0), geom.size(1)
-    pot_map = np.zeros((nr, nx))
-    for j in range(nr):
-        for i in range(nx):
-            pot_map[j, i] = epot.get3(i, j, 0)
+    # Node data as (nx, n{y|r}) arrays; transpose for imshow's (rows, cols)
+    pot_map = epot.numpy().T
     im1 = plt.imshow(pot_map, extent=ext, origin="lower", cmap="viridis")
     plt.colorbar(im1, label="Potential [V]")
     plt.title("ITER NBI Aperture: Electric Potential")
@@ -136,12 +134,8 @@ def run_simulation():
         )
 
     for i in range(0, pdb.size(), 10):
-        p = pdb.particle(i)
-        tx, tr = [], []
-        for j in range(p.traj_size()):
-            pt = p.traj(j)
-            tx.append(pt.x() * 1000)
-            tr.append(pt.r() * 1000)
+        traj = pdb.particle(i).trajectory() * 1000  # mm
+        tx, tr = traj[:, ibsimu.PARTICLE_X], traj[:, ibsimu.PARTICLE_R]
         plt.plot(tx, tr, color="blue", alpha=0.4, linewidth=0.5)
         # Mirror for visualization
         plt.plot(tx, [-r for r in tr], color="blue", alpha=0.4, linewidth=0.5)

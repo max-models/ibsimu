@@ -39,8 +39,12 @@ The Python API is built using `pybind11`. To install it from the source director
 ```bash
 # Ensure the C++ library is built first (see above)
 export LD_LIBRARY_PATH=$(pwd)/src/.libs
-LDFLAGS="-L$(pwd)/src/.libs" pip install .
+LDFLAGS="-L$(pwd)/src/.libs" pip install -e ".[dev,examples]"
 ```
+
+See [PYTHON.md](PYTHON.md) for the full guide to the Python interface,
+including macOS notes, numpy access to fields and trajectories, callbacks and
+file I/O.
 
 ## Running the Python API
 
@@ -64,7 +68,8 @@ solver = ibsimu.EpotGSSolver(geom)
 # Solve Poisson's equation
 solver.solve(epot, scharge)
 
-print("Simulation complete.")
+# Node data as a numpy array
+print(epot.numpy().shape)
 ```
 
 ### Running Tests and Examples

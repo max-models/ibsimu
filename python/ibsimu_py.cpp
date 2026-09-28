@@ -5,6 +5,7 @@
 #include <pybind11/numpy.h>
 #include <fstream>
 #include <sstream>
+#include <mutex>
 
 #include "vec3d.hpp"
 #include "vec4d.hpp"
@@ -56,8 +57,53 @@
 #include "fieldgraph.hpp"
 #include "meshcolormap.hpp"
 #include "callback.hpp"
+#include "error.hpp"
 
 namespace py = pybind11;
+
+// ---------------------------------------------------------------------------
+// Python errors raised inside callbacks
+//
+// The library calls solids and trajectory callbacks from worker threads while
+// the binding has released the GIL.  A Python exception cannot propagate
+// through those threads, so the first one is parked here and re-raised in
+// the calling thread once the C++ call returns (see rethrow_python_error()).
+// ---------------------------------------------------------------------------
+static std::mutex g_pyerr_mutex;
+static std::exception_ptr g_pyerr;
+
+static void store_python_error() {
+    std::lock_guard<std::mutex> lock(g_pyerr_mutex);
+    if (!g_pyerr) g_pyerr = std::current_exception();
+}
+
+static bool python_error_pending() {
+    std::lock_guard<std::mutex> lock(g_pyerr_mutex);
+    return (bool)g_pyerr;
+}
+
+static void rethrow_python_error() {
+    std::exception_ptr e;
+    {
+        std::lock_guard<std::mutex> lock(g_pyerr_mutex);
+        std::swap(e, g_pyerr);
+    }
+    if (e) std::rethrow_exception(e);
+}
+
+// Run f() (which calls into Python) and park any exception it raises.
+template <typename R, typename F>
+static R guarded_call(R fallback, F f) {
+    if (python_error_pending()) return fallback;
+    try {
+        return f();
+    } catch (py::error_already_set &) {
+        store_python_error();
+    } catch (std::exception &) {
+        store_python_error();
+    }
+    return fallback;
+}
 
 // ---------------------------------------------------------------------------
 // Trampoline: Solid subclassable from Python via a callable
@@ -69,92 +115,114 @@ public:
     virtual bool inside(const Vec3D &x) const override {
         Vec3D y = _T.transform_point(x);
         py::gil_scoped_acquire acquire;
-        return _func(y[0], y[1], y[2]).cast<bool>();
+        return guarded_call<bool>(false, [&]{ return _func(y[0], y[1], y[2]).cast<bool>(); });
     }
     virtual void debug_print(std::ostream &os) const override { os << "PySolid"; }
-    virtual void save(std::ostream &s) const override {}
-};
-
-// ---------------------------------------------------------------------------
-// Trampoline: CallbackFunctorD_3D subclassable from Python
-// ---------------------------------------------------------------------------
-class PyCallbackFunctorD_3D : public CallbackFunctorD_3D {
-public:
-    double operator()(double x, double y, double z) const override {
-        PYBIND11_OVERRIDE_PURE(double, CallbackFunctorD_3D, operator(), x, y, z);
+    virtual void save(std::ostream &s) const override {
+        throw std::runtime_error("FuncSolid cannot be saved to a file: "
+                                 "the solid is defined by a Python callable. "
+                                 "Use Geometry.save(filename, save_solids=False).");
     }
 };
 
 // ---------------------------------------------------------------------------
-// Trampoline: CallbackFunctorB_3D subclassable from Python
+// Trampolines: functors subclassable from Python (override __call__)
 // ---------------------------------------------------------------------------
-class PyCallbackFunctorB_3D : public CallbackFunctorB_3D {
-public:
-    bool operator()(double x, double y, double z) const override {
-        PYBIND11_OVERRIDE_PURE(bool, CallbackFunctorB_3D, operator(), x, y, z);
-    }
-};
+#define IBSIMU_PY_FUNCTOR(Base, Ret, Fallback, Args, CallArgs)                     \
+    class Py##Base : public Base {                                                  \
+    public:                                                                         \
+        Ret operator() Args const override {                                        \
+            py::gil_scoped_acquire gil;                                             \
+            return guarded_call<Ret>(Fallback, [&]() -> Ret {                        \
+                PYBIND11_OVERRIDE_PURE_NAME(Ret, Base, "__call__", operator(), CallArgs); \
+            });                                                                     \
+        }                                                                           \
+    };
+
+#define IBSIMU_ARGS(...) (__VA_ARGS__)
+#define IBSIMU_CALL(...) __VA_ARGS__
+IBSIMU_PY_FUNCTOR(CallbackFunctorD_3D, double, 0.0,   IBSIMU_ARGS(double x, double y, double z), IBSIMU_CALL(x, y, z))
+IBSIMU_PY_FUNCTOR(CallbackFunctorB_3D, bool,   false, IBSIMU_ARGS(double x, double y, double z), IBSIMU_CALL(x, y, z))
+IBSIMU_PY_FUNCTOR(CallbackFunctorD_D,  double, 0.0,   IBSIMU_ARGS(double x),                     IBSIMU_CALL(x))
+IBSIMU_PY_FUNCTOR(CallbackFunctorB_V,  bool,   false, IBSIMU_ARGS(const Vec3D &x),               IBSIMU_CALL(x))
+IBSIMU_PY_FUNCTOR(CallbackFunctorD_V,  double, 0.0,   IBSIMU_ARGS(const Vec3D &x),               IBSIMU_CALL(x))
 
 // ---------------------------------------------------------------------------
-// Trampoline: CallbackFunctorD_D subclassable from Python
+// Trampolines: trajectory callbacks
+//
+// The library hands over ParticleBase / ParticlePBase pointers, which carry
+// no run-time type information.  The concrete type follows from the geometry
+// mode, which is recorded when the callback is registered on a database.
 // ---------------------------------------------------------------------------
-class PyCallbackFunctorD_D : public CallbackFunctorD_D {
-public:
-    double operator()(double x) const override {
-        PYBIND11_OVERRIDE_PURE(double, CallbackFunctorD_D, operator(), x);
+static py::object cast_particle(ParticleBase *p, geom_mode_e mode) {
+    const auto ref = py::return_value_policy::reference;
+    switch (mode) {
+    case MODE_2D:  return py::cast(static_cast<Particle2D *>(p), ref);
+    case MODE_CYL: return py::cast(static_cast<ParticleCyl *>(p), ref);
+    case MODE_3D:  return py::cast(static_cast<Particle3D *>(p), ref);
+    default:       return py::cast(p, ref);
     }
-};
+}
 
-// ---------------------------------------------------------------------------
-// Trampoline: CallbackFunctorB_V subclassable from Python
-// ---------------------------------------------------------------------------
-class PyCallbackFunctorB_V : public CallbackFunctorB_V {
-public:
-    bool operator()(const Vec3D &x) const override {
-        PYBIND11_OVERRIDE_PURE(bool, CallbackFunctorB_V, operator(), x);
+static py::object cast_particlep(ParticlePBase *x, geom_mode_e mode) {
+    const auto ref = py::return_value_policy::reference;
+    switch (mode) {
+    case MODE_2D:  return py::cast(static_cast<ParticleP2D *>(x), ref);
+    case MODE_CYL: return py::cast(static_cast<ParticlePCyl *>(x), ref);
+    case MODE_3D:  return py::cast(static_cast<ParticleP3D *>(x), ref);
+    default:       return py::cast(x, ref);
     }
-};
+}
 
-// ---------------------------------------------------------------------------
-// Trampoline: CallbackFunctorD_V subclassable from Python
-// ---------------------------------------------------------------------------
-class PyCallbackFunctorD_V : public CallbackFunctorD_V {
-public:
-    double operator()(const Vec3D &x) const override {
-        PYBIND11_OVERRIDE_PURE(double, CallbackFunctorD_V, operator(), x);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Trampoline: TrajectoryHandlerCallback subclassable from Python
-// ---------------------------------------------------------------------------
 class PyTrajectoryHandlerCallback : public TrajectoryHandlerCallback {
 public:
+    geom_mode_e mode = MODE_2D;
     void operator()(ParticleBase *particle, ParticlePBase *xcur, ParticlePBase *xend) override {
-        PYBIND11_OVERRIDE_PURE(void, TrajectoryHandlerCallback, operator(), particle, xcur, xend);
+        py::gil_scoped_acquire gil;
+        guarded_call<int>(0, [&]{
+            py::function f = py::get_override(static_cast<const TrajectoryHandlerCallback *>(this), "__call__");
+            if (!f) py::pybind11_fail("TrajectoryHandlerCallback subclass must define __call__");
+            f(cast_particle(particle, mode), cast_particlep(xcur, mode), cast_particlep(xend, mode));
+            return 0;
+        });
     }
 };
 
-// ---------------------------------------------------------------------------
-// Trampoline: TrajectoryEndCallback subclassable from Python
-// ---------------------------------------------------------------------------
 class PyTrajectoryEndCallback : public TrajectoryEndCallback {
 public:
+    geom_mode_e mode = MODE_2D;
     void operator()(ParticleBase *particle, ParticleDataBase *pdb) override {
-        PYBIND11_OVERRIDE_PURE(void, TrajectoryEndCallback, operator(), particle, pdb);
+        py::gil_scoped_acquire gil;
+        guarded_call<int>(0, [&]{
+            py::function f = py::get_override(static_cast<const TrajectoryEndCallback *>(this), "__call__");
+            if (!f) py::pybind11_fail("TrajectoryEndCallback subclass must define __call__");
+            f(cast_particle(particle, pdb->geom_mode()), py::cast(pdb, py::return_value_policy::reference));
+            return 0;
+        });
     }
 };
 
-// ---------------------------------------------------------------------------
-// Trampoline: TrajectorySurfaceCollisionCallback subclassable from Python
-// ---------------------------------------------------------------------------
 class PyTrajectorySurfaceCollisionCallback : public TrajectorySurfaceCollisionCallback {
 public:
+    geom_mode_e mode = MODE_2D;
     void operator()(ParticleBase *particle, ParticlePBase *x, uint32_t tri,
                     double s, double t) override {
-        PYBIND11_OVERRIDE_PURE(void, TrajectorySurfaceCollisionCallback, operator(), particle, x, tri, s, t);
+        py::gil_scoped_acquire gil;
+        guarded_call<int>(0, [&]{
+            py::function f = py::get_override(static_cast<const TrajectorySurfaceCollisionCallback *>(this), "__call__");
+            if (!f) py::pybind11_fail("TrajectorySurfaceCollisionCallback subclass must define __call__");
+            f(cast_particle(particle, mode), cast_particlep(x, mode), tri, s, t);
+            return 0;
+        });
     }
 };
+
+// Register a callback on a database, telling a Python trampoline the geometry mode.
+template <typename CB, typename PyCB>
+static void register_callback(ParticleDataBase &pdb, CB *cb, void (ParticleDataBase::*setter)(CB *)) {
+    if (auto *p = dynamic_cast<PyCB *>(cb)) p->mode = pdb.geom_mode();
+    (pdb.*setter)(cb);
+}
 
 // ---------------------------------------------------------------------------
 // Trampoline: Random_Variate_Transformation subclassable from Python
@@ -190,9 +258,119 @@ static void list_to_fout(const py::list &lst, bool fout[3]) {
     for (int i = 0; i < 3; i++) fout[i] = lst[i].cast<bool>();
 }
 
+// ---------------------------------------------------------------------------
+// Helpers: numpy views of mesh-shaped data
+//
+// IBSimu stores node data with the x index varying fastest
+// (index = i + (j + k*ny)*nx).  The arrays returned here carry that layout
+// as Fortran-order strides, so a[i, j, k] is node (i, j, k) with no copying.
+// The trailing dimensions are dropped for 1D and 2D/cylindrical meshes.
+// ---------------------------------------------------------------------------
+static std::vector<py::ssize_t> mesh_shape(const Mesh &m) {
+    switch (m.geom_mode()) {
+    case MODE_1D:  return { (py::ssize_t)m.size(0) };
+    case MODE_2D:
+    case MODE_CYL: return { (py::ssize_t)m.size(0), (py::ssize_t)m.size(1) };
+    default:       return { (py::ssize_t)m.size(0), (py::ssize_t)m.size(1),
+                            (py::ssize_t)m.size(2) };
+    }
+}
+
+static std::vector<py::ssize_t> mesh_strides(const Mesh &m, py::ssize_t itemsize,
+                                             py::ssize_t ncomp = 0) {
+    // With ncomp > 0 a trailing component axis (contiguous) is appended.
+    std::vector<py::ssize_t> st;
+    py::ssize_t s = itemsize * (ncomp > 0 ? ncomp : 1);
+    for (size_t d = 0; d < mesh_shape(m).size(); d++) {
+        st.push_back(s);
+        s *= m.size((int)d);
+    }
+    if (ncomp > 0) st.push_back(itemsize);
+    return st;
+}
+
+template <typename T>
+static py::array_t<T> mesh_view(const Mesh &m, T *ptr, py::handle base) {
+    if (m.nodecount() == 0 || ptr == nullptr)
+        throw std::runtime_error("Field has no mesh data");
+    return py::array_t<T>(mesh_shape(m), mesh_strides(m, sizeof(T)), ptr, base);
+}
+
+static py::array_t<double> vector_field_to_numpy(const MeshVectorField &f) {
+    std::vector<py::ssize_t> shape = mesh_shape(f);
+    shape.push_back(3);
+    py::array_t<double> arr(shape, mesh_strides(f, sizeof(double), 3));
+    double *out = arr.mutable_data();
+    for (uint32_t i = 0; i < f.nodecount(); i++) {
+        Vec3D v = f(i);
+        out[3*i] = v[0]; out[3*i+1] = v[1]; out[3*i+2] = v[2];
+    }
+    return arr;
+}
+
+static void vector_field_from_numpy(MeshVectorField &f,
+        py::array_t<double, py::array::c_style | py::array::forcecast> arr) {
+    std::vector<py::ssize_t> shape = mesh_shape(f);
+    shape.push_back(3);
+    if ((size_t)arr.ndim() != shape.size())
+        throw std::invalid_argument("Array has wrong number of dimensions");
+    for (size_t d = 0; d < shape.size(); d++)
+        if (arr.shape(d) != shape[d])
+            throw std::invalid_argument("Array shape does not match the field mesh");
+    // C-contiguous with x as the first axis: node (i,j,k) sits at
+    // ((i*ny + j)*nz + k)*3, which is not the field's own ordering.
+    const uint32_t nx = f.size(0), ny = f.size(1), nz = f.size(2);
+    const double *in = arr.data();
+    for (uint32_t k = 0; k < nz; k++)
+        for (uint32_t j = 0; j < ny; j++)
+            for (uint32_t i = 0; i < nx; i++) {
+                const double *v = in + ((size_t)(i*ny + j)*nz + k)*3;
+                f.set((int32_t)(i + (j + k*ny)*nx), Vec3D(v[0], v[1], v[2]));
+            }
+}
+
+// Trajectory of one particle as an (npoints, ncoord) array.
+template <typename P, typename PP>
+static py::array_t<double> trajectory_array(const P &p) {
+    const size_t n = p.traj_size();
+    const size_t m = PP().size();
+    py::array_t<double> arr({ (py::ssize_t)n, (py::ssize_t)m });
+    auto a = arr.template mutable_unchecked<2>();
+    for (size_t j = 0; j < n; j++)
+        for (size_t k = 0; k < m; k++)
+            a(j, k) = p.traj((int)j)((int)k);
+    return arr;
+}
+
+static py::array_t<double> vector_to_numpy(const std::vector<double> &v) {
+    return py::array_t<double>((py::ssize_t)v.size(), v.data());
+}
+
 // ===========================================================================
 PYBIND11_MODULE(ibsimu, m) {
     m.doc() = "Python wrapper for IBSimu";
+
+    // -----------------------------------------------------------------------
+    // Exceptions: map the library's Error hierarchy onto Python exceptions
+    // -----------------------------------------------------------------------
+    static py::exception<Error> ibsimu_error(m, "IBSimuError", PyExc_RuntimeError);
+    py::register_exception_translator([](std::exception_ptr p) {
+        try {
+            if (p) std::rethrow_exception(p);
+        } catch (ErrorRange &e) {
+            PyErr_SetString(PyExc_IndexError, e.get_error_message().c_str());
+        } catch (ErrorDim &e) {
+            PyErr_SetString(PyExc_ValueError, e.get_error_message().c_str());
+        } catch (ErrorUnimplemented &e) {
+            PyErr_SetString(PyExc_NotImplementedError, e.get_error_message().c_str());
+        } catch (ErrorNoMem &e) {
+            PyErr_SetString(PyExc_MemoryError, e.get_error_message().c_str());
+        } catch (Error &e) {
+            std::string msg = e.get_error_message();
+            if (msg.empty()) msg = "IBSimu error";
+            ibsimu_error(msg.c_str());
+        }
+    });
 
     // -----------------------------------------------------------------------
     // Physical constants
@@ -337,6 +515,21 @@ PYBIND11_MODULE(ibsimu, m) {
     py::enum_<histogram_accumulation_e>(m, "HistogramAccumulation")
         .value("HISTOGRAM_ACCUMULATION_CLOSEST", HISTOGRAM_ACCUMULATION_CLOSEST)
         .value("HISTOGRAM_ACCUMULATION_LINEAR",  HISTOGRAM_ACCUMULATION_LINEAR)
+        .export_values();
+
+    py::enum_<interpolation_e>(m, "Interpolation")
+        .value("INTERPOLATION_CLOSEST",  INTERPOLATION_CLOSEST)
+        .value("INTERPOLATION_BILINEAR", INTERPOLATION_BILINEAR)
+        .value("INTERPOLATION_BICUBIC",  INTERPOLATION_BICUBIC)
+        .export_values();
+
+    py::enum_<view_e>(m, "View")
+        .value("VIEW_XY", VIEW_XY)
+        .value("VIEW_XZ", VIEW_XZ)
+        .value("VIEW_YX", VIEW_YX)
+        .value("VIEW_YZ", VIEW_YZ)
+        .value("VIEW_ZX", VIEW_ZX)
+        .value("VIEW_ZY", VIEW_ZY)
         .export_values();
 
     py::enum_<zscale_e>(m, "ZScale")
@@ -484,22 +677,58 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("origo",      [](const Mesh &me, int i){ return me.origo(i); })
         .def("origo_vec",  [](const Mesh &me){ return me.origo(); })
         .def("max",        [](const Mesh &me, int i){ return me.max(i); })
-        .def("max_vec",    [](const Mesh &me){ return me.max(); });
+        .def("max_vec",    [](const Mesh &me){ return me.max(); })
+        .def("size_vec",   [](const Mesh &me){ return me.size(); })
+        .def("shape",      [](const Mesh &me){
+            py::tuple t(mesh_shape(me).size());
+            size_t d = 0;
+            for (auto n : mesh_shape(me)) t[d++] = n;
+            return t;
+        }, "Shape of the node arrays returned by numpy(): (nx,), (nx, ny) or (nx, ny, nz)")
+        .def("closest_node",  &Mesh::closest_node)
+        .def("mesh_number",   &Mesh::mesh_number)
+        .def("coord_of_node", &Mesh::coord_of_node)
+        .def("node_coordinates", [](const Mesh &me){
+            // Coordinate axes of the mesh nodes, one 1D array per dimension.
+            py::list axes;
+            for (size_t d = 0; d < mesh_shape(me).size(); d++) {
+                py::array_t<double> ax((py::ssize_t)me.size((int)d));
+                double *p = ax.mutable_data();
+                for (uint32_t i = 0; i < me.size((int)d); i++) p[i] = me.origo((int)d) + i*me.h();
+                axes.append(ax);
+            }
+            return py::tuple(axes);
+        }, "Node coordinate axes as a tuple of 1D arrays (x, [y|r, [z]])");
 
     // -----------------------------------------------------------------------
     // Bound
     // -----------------------------------------------------------------------
     py::class_<Bound>(m, "Bound")
-        .def(py::init<bound_e, double>())
+        .def(py::init<bound_e, double>(), py::arg("type"), py::arg("value"))
+        .def(py::init<bound_e, const CallbackFunctorD_V *>(), py::arg("type"), py::arg("functor"),
+             py::keep_alive<1, 3>(), "Boundary whose value varies with position via a functor")
         .def("type",  &Bound::type)
         .def("value", [](const Bound &b){ return b.value(); })
-        .def("value_at", [](const Bound &b, const Vec3D &x){ return b.value(x); });
+        .def("value_at", [](const Bound &b, const Vec3D &x){
+            double v = b.value(x); rethrow_python_error(); return v;
+        })
+        .def("set_value", &Bound::set_value)
+        .def("is_constant", &Bound::is_constant)
+        .def("__repr__", [](const Bound &b){
+            std::ostringstream oss; oss << b; return "Bound(" + oss.str() + ")";
+        });
 
     // -----------------------------------------------------------------------
     // Geometry
     // -----------------------------------------------------------------------
     py::class_<Geometry, Mesh>(m, "Geometry")
-        .def(py::init<geom_mode_e, Int3D, Vec3D, double>())
+        .def(py::init<geom_mode_e, Int3D, Vec3D, double>(),
+             py::arg("geom_mode"), py::arg("size"), py::arg("origo"), py::arg("h"))
+        .def(py::init([](const std::string &filename){
+            std::ifstream is(filename);
+            if (!is) throw std::runtime_error("Cannot open file: " + filename);
+            return new Geometry(is);
+        }), py::arg("filename"), "Load a geometry saved with Geometry.save()")
         // Geometry takes ownership of the solid (it deletes the old one when a
         // solid number is redefined), so the Python side must stop owning it.
         // keep_alive additionally ties the wrapper's lifetime to the geometry,
@@ -508,27 +737,39 @@ PYBIND11_MODULE(ibsimu, m) {
             const Solid *s = solid.cast<const Solid *>();
             reinterpret_cast<py::detail::instance *>(solid.ptr())->owned = false;
             g.set_solid(n, s);
-        }, py::keep_alive<1, 3>())
-        .def("get_solid",   &Geometry::get_solid, py::return_value_policy::reference)
-        .def("set_boundary",&Geometry::set_boundary)
-        .def("get_boundary",&Geometry::get_boundary)
+        }, py::keep_alive<1, 3>(), py::arg("n"), py::arg("solid"),
+             "Assign solid number n (>= 7); the geometry takes ownership of the solid")
+        .def("get_solid",   &Geometry::get_solid, py::return_value_policy::reference, py::arg("n"))
+        .def("set_boundary",&Geometry::set_boundary, py::arg("n"), py::arg("b"))
+        .def("get_boundary",&Geometry::get_boundary, py::arg("n"))
+        // Geometry::get_boundaries() is declared but not implemented in the library.
+        .def("get_boundaries", [](const Geometry &g){
+            std::vector<Bound> b;
+            for (uint32_t i = 1; i <= g.number_of_boundaries(); i++) b.push_back(g.get_boundary(i));
+            return b;
+        }, "List of boundary conditions, index 0 is boundary number 1")
         .def("number_of_solids",     &Geometry::number_of_solids)
         .def("number_of_boundaries", &Geometry::number_of_boundaries)
         .def("have_solid_data",      &Geometry::have_solid_data)
         .def("build_mesh",  [](Geometry &g){
-            py::gil_scoped_release release;
-            g.build_mesh();
+            { py::gil_scoped_release release; g.build_mesh(); }
+            rethrow_python_error();
         })
         .def("build_surface",[](Geometry &g){
-            py::gil_scoped_release release;
-            g.build_surface();
+            { py::gil_scoped_release release; g.build_surface(); }
+            rethrow_python_error();
         })
         .def("surface_built",&Geometry::surface_built)
-        .def("inside",      [](const Geometry &g, const Vec3D &x){ return g.inside(x); })
-        .def("inside_n",    [](const Geometry &g, uint32_t n, const Vec3D &x){ return g.inside(n, x); })
+        .def("inside",      [](const Geometry &g, const Vec3D &x){
+            uint32_t r = g.inside(x); rethrow_python_error(); return r;
+        })
+        .def("inside_n",    [](const Geometry &g, uint32_t n, const Vec3D &x){
+            bool r = g.inside(n, x); rethrow_python_error(); return r;
+        })
         .def("bracket_surface", [](const Geometry &g, uint32_t n, const Vec3D &xin, const Vec3D &xout){
             Vec3D xsurf;
             double s = g.bracket_surface(n, xin, xout, xsurf);
+            rethrow_python_error();
             return py::make_tuple(s, xsurf);
         })
         .def("surface_normal", &Geometry::surface_normal)
@@ -539,6 +780,27 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("mesh_check2",    [](const Geometry &g, int32_t i, int32_t j){ return g.mesh_check(i,j); })
         .def("mesh_check3",    [](const Geometry &g, int32_t i, int32_t j, int32_t k){ return g.mesh_check(i,j,k); })
         .def("is_near_solid",  &Geometry::is_near_solid)
+        .def("mesh_numpy", [](py::object self){
+            const Geometry &g = self.cast<const Geometry &>();
+            if (!g.built()) throw std::runtime_error("Mesh not built");
+            py::array_t<uint32_t> a = mesh_view<uint32_t>(g, const_cast<uint32_t *>(&g.mesh(0)), self);
+            py::detail::array_proxy(a.ptr())->flags &= ~py::detail::npy_api::NPY_ARRAY_WRITEABLE_;
+            return a;
+        }, "Read-only view of the solid mesh (node type flags | boundary number, see geometry.hpp)")
+        .def("solid_numpy", [](const Geometry &g){
+            // Boundary/solid number of each node: 0 vacuum, 1-6 mesh boundaries,
+            // >= 7 solids.  Vacuum nodes near a solid are 0 as well.
+            if (!g.built()) throw std::runtime_error("Mesh not built");
+            py::array_t<uint32_t> a(mesh_shape(g), mesh_strides(g, sizeof(uint32_t)));
+            uint32_t *out = a.mutable_data();
+            for (uint32_t i = 0; i < g.nodecount(); i++) {
+                uint32_t v = g.mesh((int32_t)i);
+                uint32_t id = v & SMESH_NODE_ID_MASK;
+                out[i] = (id == SMESH_NODE_ID_DIRICHLET || id == SMESH_NODE_ID_NEUMANN)
+                         ? (v & SMESH_BOUNDARY_NUMBER_MASK) : 0;
+            }
+            return a;
+        }, "Boundary/solid number of every node as an array (0 = vacuum)")
         .def("surface_vertexc",&Geometry::surface_vertexc)
         .def("surface_vertex", &Geometry::surface_vertex, py::return_value_policy::reference_internal)
         .def("surface_triangle_normal", (Vec3D (Geometry::*)(const Vec3D &) const) &Geometry::surface_triangle_normal)
@@ -555,15 +817,17 @@ PYBIND11_MODULE(ibsimu, m) {
     // Solid hierarchy
     // -----------------------------------------------------------------------
     py::class_<Solid, std::unique_ptr<Solid, py::nodelete>>(m, "Solid")
-        .def("inside", &Solid::inside)
+        .def("inside", [](const Solid &s, const Vec3D &x){
+            bool r = s.inside(x); rethrow_python_error(); return r;
+        })
         .def("reset_transformation", &Solid::reset_transformation)
         .def("set_transformation",   &Solid::set_transformation)
-        .def("translate", &Solid::translate)
+        .def("translate", &Solid::translate, py::arg("dx"))
         .def("scale",     (void (Solid::*)(double)) &Solid::scale)
         .def("scale_v",   (void (Solid::*)(const Vec3D &)) &Solid::scale)
-        .def("rotate_x",  &Solid::rotate_x)
-        .def("rotate_y",  &Solid::rotate_y)
-        .def("rotate_z",  &Solid::rotate_z);
+        .def("rotate_x",  &Solid::rotate_x, py::arg("a"))
+        .def("rotate_y",  &Solid::rotate_y, py::arg("a"))
+        .def("rotate_z",  &Solid::rotate_z, py::arg("a"));
 
     py::class_<PySolid, Solid>(m, "PySolid");
 
@@ -626,9 +890,26 @@ PYBIND11_MODULE(ibsimu, m) {
         .def(py::init<const Mesh &>())
         .def(py::init<const MeshScalarField &>())
         .def(py::init([](const std::string &filename){
-            std::ifstream is(filename); return new MeshScalarField(is);
-        }))
+            std::ifstream is(filename);
+            if (!is) throw std::runtime_error("Cannot open file: " + filename);
+            return new MeshScalarField(is);
+        }), py::arg("filename"))
         .def("__call__",   [](const MeshScalarField &f, const Vec3D &x){ return f(x); })
+        .def("numpy", [](py::object self){
+            MeshScalarField &f = self.cast<MeshScalarField &>();
+            return mesh_view<double>(f, f.nodecount() ? &f(0) : nullptr, self);
+        }, "Writable numpy view of the node data, shape (nx,), (nx, ny) or (nx, ny, nz)")
+        .def("__array__", [](py::object self, py::object dtype, py::object copy){
+            MeshScalarField &f = self.cast<MeshScalarField &>();
+            py::array a = mesh_view<double>(f, f.nodecount() ? &f(0) : nullptr, self);
+            if (!dtype.is_none()) a = a.attr("astype")(dtype);
+            else if (copy.is(py::bool_(true))) a = a.attr("copy")();
+            return a;
+        }, py::arg("dtype") = py::none(), py::arg("copy") = py::none())
+        .def("set_numpy", [](MeshScalarField &f, py::array_t<double> arr){
+            py::array_t<double> view = mesh_view<double>(f, f.nodecount() ? &f(0) : nullptr, py::none());
+            view.attr("__setitem__")(py::ellipsis(), arr);
+        }, py::arg("array"), "Copy array values into the field (broadcasting allowed)")
         .def("get",        [](const MeshScalarField &f, uint32_t i){ return f(i); })
         .def("set",        [](MeshScalarField &f, uint32_t i, double v){ f(i) = v; })
         .def("get3",       [](const MeshScalarField &f, uint32_t i, uint32_t j, uint32_t k){ return f(i,j,k); })
@@ -661,7 +942,13 @@ PYBIND11_MODULE(ibsimu, m) {
     // EpotField
     // -----------------------------------------------------------------------
     py::class_<EpotField, MeshScalarField>(m, "EpotField")
-        .def(py::init<Geometry &>());
+        .def(py::init<const Geometry &>(), py::arg("geom"))
+        .def(py::init<const EpotField &>())
+        .def(py::init([](const std::string &filename, const Geometry &geom){
+            std::ifstream is(filename);
+            if (!is) throw std::runtime_error("Cannot open file: " + filename);
+            return new EpotField(is, geom);
+        }), py::arg("filename"), py::arg("geom"), "Load a potential saved with save()");
 
     // -----------------------------------------------------------------------
     // MeshVectorField
@@ -681,11 +968,30 @@ PYBIND11_MODULE(ibsimu, m) {
             bool fo[3]; list_to_fout(fout, fo);
             return new MeshVectorField(mode, fo, xscale, fscale, filename);
         }))
+        .def(py::init([](geom_mode_e mode, py::list fout, Int3D size, Vec3D origo, double h,
+                         const MeshVectorField &fin){
+            bool fo[3]; list_to_fout(fout, fo);
+            return new MeshVectorField(mode, fo, size, origo, h, fin);
+        }), py::arg("mode"), py::arg("fout"), py::arg("size"), py::arg("origo"), py::arg("h"),
+            py::arg("fin"), "Resample an existing field onto a new mesh")
         .def(py::init<const MeshVectorField &>())
         .def(py::init([](const std::string &filename){
-            std::ifstream is(filename); return new MeshVectorField(is);
-        }))
+            std::ifstream is(filename);
+            if (!is) throw std::runtime_error("Cannot open file: " + filename);
+            return new MeshVectorField(is);
+        }), py::arg("filename"))
         .def("__call__", [](const MeshVectorField &f, const Vec3D &x){ return f(x); })
+        .def("numpy", &vector_field_to_numpy,
+             "Copy of the node vectors, shape (..., 3) matching Mesh.shape()")
+        .def("set_numpy", &vector_field_from_numpy, py::arg("array"),
+             "Set node vectors from an array of shape (..., 3)")
+        .def("reset", [](MeshVectorField &f, geom_mode_e mode, py::list fout, Int3D size,
+                         Vec3D origo, double h){
+            bool fo[3]; list_to_fout(fout, fo); f.reset(mode, fo, size, origo, h);
+        })
+        .def("__iadd__", [](MeshVectorField &a, const MeshVectorField &b){ a += b; return a; })
+        .def("__imul__", [](MeshVectorField &a, double s){ a *= s; return a; })
+        .def("__itruediv__", [](MeshVectorField &a, double s){ a /= s; return a; })
         .def("get1",     [](const MeshVectorField &f, uint32_t i){ return f(i); })
         .def("get2",     [](const MeshVectorField &f, uint32_t i, uint32_t j){ return f(i,j); })
         .def("get3",     [](const MeshVectorField &f, uint32_t i, uint32_t j, uint32_t k){ return f(i,j,k); })
@@ -755,26 +1061,32 @@ PYBIND11_MODULE(ibsimu, m) {
     py::class_<CallbackFunctorD_3D, PyCallbackFunctorD_3D>(m, "CallbackFunctorD_3D")
         .def(py::init<>())
         .def("__call__", [](const CallbackFunctorD_3D &f, double x, double y, double z){
-            return f(x, y, z);
+            auto r = f(x, y, z); rethrow_python_error(); return r;
         });
 
     py::class_<CallbackFunctorD_V, PyCallbackFunctorD_V>(m, "CallbackFunctorD_V")
         .def(py::init<>())
-        .def("__call__", [](const CallbackFunctorD_V &f, const Vec3D &x){ return f(x); });
+        .def("__call__", [](const CallbackFunctorD_V &f, const Vec3D &x){
+            auto r = f(x); rethrow_python_error(); return r;
+        });
 
     py::class_<CallbackFunctorB_3D, PyCallbackFunctorB_3D>(m, "CallbackFunctorB_3D")
         .def(py::init<>())
         .def("__call__", [](const CallbackFunctorB_3D &f, double x, double y, double z){
-            return f(x, y, z);
+            auto r = f(x, y, z); rethrow_python_error(); return r;
         });
 
     py::class_<CallbackFunctorB_V, PyCallbackFunctorB_V>(m, "CallbackFunctorB_V")
         .def(py::init<>())
-        .def("__call__", [](const CallbackFunctorB_V &f, const Vec3D &x){ return f(x); });
+        .def("__call__", [](const CallbackFunctorB_V &f, const Vec3D &x){
+            auto r = f(x); rethrow_python_error(); return r;
+        });
 
     py::class_<CallbackFunctorD_D, PyCallbackFunctorD_D>(m, "CallbackFunctorD_D")
         .def(py::init<>())
-        .def("__call__", [](const CallbackFunctorD_D &f, double x){ return f(x); });
+        .def("__call__", [](const CallbackFunctorD_D &f, double x){
+            auto r = f(x); rethrow_python_error(); return r;
+        });
 
     py::class_<InitialPlasma, CallbackFunctorB_V>(m, "InitialPlasma")
         .def(py::init<coordinate_axis_e, double>());
@@ -790,15 +1102,15 @@ PYBIND11_MODULE(ibsimu, m) {
     // -----------------------------------------------------------------------
     py::class_<EpotSolver>(m, "EpotSolver")
         .def("solve", [](EpotSolver &s, MeshScalarField &epot, const ScalarField &sc){
-            py::gil_scoped_release release;
-            s.solve(epot, sc);
-        })
-        .def("set_pexp_plasma",   &EpotSolver::set_pexp_plasma)
-        .def("set_nsimp_plasma",  &EpotSolver::set_nsimp_plasma)
-        .def("set_shield_plasma", &EpotSolver::set_shield_plasma)
-        .def("set_initial_plasma",&EpotSolver::set_initial_plasma)
-        .def("set_forced_potential_volume", (void (EpotSolver::*)(double, CallbackFunctorB_V*)) &EpotSolver::set_forced_potential_volume)
-        .def("set_forced_potential_volume_func", (void (EpotSolver::*)(CallbackFunctorD_V*)) &EpotSolver::set_forced_potential_volume)
+            { py::gil_scoped_release release; s.solve(epot, sc); }
+            rethrow_python_error();
+        }, py::arg("epot"), py::arg("scharge"))
+        .def("set_pexp_plasma",   &EpotSolver::set_pexp_plasma, py::arg("rhoe"), py::arg("Te"), py::arg("Up"))
+        .def("set_nsimp_plasma",  &EpotSolver::set_nsimp_plasma, py::arg("rhop"), py::arg("Ep"), py::arg("rhoi"), py::arg("Ei"))
+        .def("set_shield_plasma", &EpotSolver::set_shield_plasma, py::arg("Tm"), py::arg("Um"))
+        .def("set_initial_plasma",&EpotSolver::set_initial_plasma, py::keep_alive<1, 3>())
+        .def("set_forced_potential_volume", (void (EpotSolver::*)(double, CallbackFunctorB_V*)) &EpotSolver::set_forced_potential_volume, py::keep_alive<1, 3>())
+        .def("set_forced_potential_volume_func", (void (EpotSolver::*)(CallbackFunctorD_V*)) &EpotSolver::set_forced_potential_volume, py::keep_alive<1, 2>())
         .def("set_plasma_calc_region", &EpotSolver::set_plasma_calc_region)
         .def("linear",            &EpotSolver::linear)
         .def("geometry", &EpotSolver::geometry, py::return_value_policy::reference);
@@ -808,10 +1120,10 @@ PYBIND11_MODULE(ibsimu, m) {
     // -----------------------------------------------------------------------
     py::class_<EpotGSSolver, EpotSolver>(m, "EpotGSSolver")
         .def(py::init<Geometry &>())
-        .def("set_eps",   &EpotGSSolver::set_eps)
-        .def("set_imax",  &EpotGSSolver::set_imax)
-        .def("set_w",     &EpotGSSolver::set_w)
-        .def("set_plasma_solver_parameters", &EpotGSSolver::set_plasma_solver_parameters)
+        .def("set_eps",   &EpotGSSolver::set_eps, py::arg("eps"))
+        .def("set_imax",  &EpotGSSolver::set_imax, py::arg("imax"))
+        .def("set_w",     &EpotGSSolver::set_w, py::arg("w"))
+        .def("set_plasma_solver_parameters", &EpotGSSolver::set_plasma_solver_parameters, py::arg("Ulim_fac"), py::arg("imax"), py::arg("eps"))
         .def("get_potential_change_norm", &EpotGSSolver::get_potential_change_norm)
         .def("get_error_estimate",        &EpotGSSolver::get_error_estimate)
         .def("get_iter",                  &EpotGSSolver::get_iter);
@@ -821,12 +1133,12 @@ PYBIND11_MODULE(ibsimu, m) {
     // -----------------------------------------------------------------------
     py::class_<EpotMGSolver, EpotSolver>(m, "EpotMGSolver")
         .def(py::init<Geometry &>())
-        .def("set_eps",    &EpotMGSolver::set_eps)
-        .def("set_imax",   &EpotMGSolver::set_imax)
-        .def("set_levels", &EpotMGSolver::set_levels)
-        .def("set_npre",   &EpotMGSolver::set_npre)
-        .def("set_npost",  &EpotMGSolver::set_npost)
-        .def("set_gamma",  &EpotMGSolver::set_gamma);
+        .def("set_eps",    &EpotMGSolver::set_eps, py::arg("eps"))
+        .def("set_imax",   &EpotMGSolver::set_imax, py::arg("imax"))
+        .def("set_levels", &EpotMGSolver::set_levels, py::arg("levels"))
+        .def("set_npre",   &EpotMGSolver::set_npre, py::arg("npre"))
+        .def("set_npost",  &EpotMGSolver::set_npost, py::arg("npost"))
+        .def("set_gamma",  &EpotMGSolver::set_gamma, py::arg("gamma"));
 
     // EpotMatrixSolver intermediate base (needed for BiCGSTAB / UMFPACK)
     py::class_<EpotMatrixSolver, EpotSolver>(m, "EpotMatrixSolver");
@@ -836,8 +1148,8 @@ PYBIND11_MODULE(ibsimu, m) {
     // -----------------------------------------------------------------------
     py::class_<EpotBiCGSTABSolver, EpotMatrixSolver>(m, "EpotBiCGSTABSolver")
         .def(py::init<Geometry &>())
-        .def("set_eps",  &EpotBiCGSTABSolver::set_eps)
-        .def("set_imax", &EpotBiCGSTABSolver::set_imax);
+        .def("set_eps",  &EpotBiCGSTABSolver::set_eps, py::arg("eps"))
+        .def("set_imax", &EpotBiCGSTABSolver::set_imax, py::arg("imax"));
 
 #ifdef HAVE_LIBUMFPACK
     // EpotUMFPACKSolver (only available when UMFPACK is installed)
@@ -942,6 +1254,8 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("traj_size", &Particle2D::traj_size)
         .def("traj",      [](const Particle2D &p, int i) -> const ParticleP2D& { return p.traj(i); },
              py::return_value_policy::reference_internal)
+        .def("trajectory", &trajectory_array<Particle2D, ParticleP2D>,
+             "Saved trajectory as an (npoints, ncoord) array; columns as in ParticleP2D")
         .def("clear_trajectory", &Particle2D::clear_trajectory)
         .def("reset_trajectory", &Particle2D::reset_trajectory);
 
@@ -957,6 +1271,8 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("traj_size", &ParticleCyl::traj_size)
         .def("traj",      [](const ParticleCyl &p, int i) -> const ParticlePCyl& { return p.traj(i); },
              py::return_value_policy::reference_internal)
+        .def("trajectory", &trajectory_array<ParticleCyl, ParticlePCyl>,
+             "Saved trajectory as an (npoints, ncoord) array; columns as in ParticlePCyl")
         .def("clear_trajectory", &ParticleCyl::clear_trajectory)
         .def("reset_trajectory", &ParticleCyl::reset_trajectory);
 
@@ -972,6 +1288,8 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("traj_size", &Particle3D::traj_size)
         .def("traj",      [](const Particle3D &p, int i) -> const ParticleP3D& { return p.traj(i); },
              py::return_value_policy::reference_internal)
+        .def("trajectory", &trajectory_array<Particle3D, ParticleP3D>,
+             "Saved trajectory as an (npoints, ncoord) array; columns as in ParticleP3D")
         .def("clear_trajectory", &Particle3D::clear_trajectory)
         .def("reset_trajectory", &Particle3D::reset_trajectory);
 
@@ -993,7 +1311,8 @@ PYBIND11_MODULE(ibsimu, m) {
     // -----------------------------------------------------------------------
     py::class_<TrajectoryDiagnosticColumn>(m, "TrajectoryDiagnosticColumn")
         .def(py::init<trajectory_diagnostic_e>())
-        .def("data",       [](const TrajectoryDiagnosticColumn &c){ return c.data(); })
+        .def("data",       [](const TrajectoryDiagnosticColumn &c){ return vector_to_numpy(c.data()); },
+             "Column values as a numpy array")
         .def("size",       &TrajectoryDiagnosticColumn::size)
         .def("diagnostic", &TrajectoryDiagnosticColumn::diagnostic)
         .def("__call__",   [](const TrajectoryDiagnosticColumn &c, size_t i){ return c(i); })
@@ -1106,7 +1425,7 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("get_bin_range", [](const Histogram1D &h){
             double mn, mx; h.get_bin_range(mn,mx); return py::make_tuple(mn,mx);
         })
-        .def("get_data", [](const Histogram1D &h){ return h.get_data(); })
+        .def("get_data", [](const Histogram1D &h){ return vector_to_numpy(h.get_data()); })
         .def("__call__", [](const Histogram1D &h, uint32_t i){ return h(i); });
 
     // -----------------------------------------------------------------------
@@ -1116,7 +1435,8 @@ PYBIND11_MODULE(ibsimu, m) {
         .def(py::init([](uint32_t n, uint32_t mm, py::list range){
             double r[4]; for(int i=0;i<4;i++) r[i]=range[i].cast<double>();
             return new Histogram2D(n, mm, r);
-        }))
+        }), py::arg("n"), py::arg("m"), py::arg("range"),
+            "n x m histogram (n, m >= 4) with range [xmin, ymin, xmax, ymax]")
         .def(py::init([](uint32_t n, uint32_t mm,
                          const std::vector<double> &xd, const std::vector<double> &yd,
                          histogram_accumulation_e type){
@@ -1148,7 +1468,12 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("get_bin_range", [](const Histogram2D &h){
             double mn, mx; h.get_bin_range(mn,mx); return py::make_tuple(mn,mx);
         })
-        .def("get_data", [](const Histogram2D &h){ return h.get_data(); })
+        .def("get_data", [](const Histogram2D &h){
+            // Stored as data[i + j*n]; expose as an (n, m) array with h[i, j].
+            return py::array_t<double>({ (py::ssize_t)h.n(), (py::ssize_t)h.m() },
+                                       { (py::ssize_t)sizeof(double), (py::ssize_t)(sizeof(double)*h.n()) },
+                                       h.get_data().data());
+        }, "Bin values as an (n, m) array")
         .def("__call__", [](const Histogram2D &h, uint32_t i, uint32_t j){ return h(i,j); });
 
     // -----------------------------------------------------------------------
@@ -1231,10 +1556,10 @@ PYBIND11_MODULE(ibsimu, m) {
     // -----------------------------------------------------------------------
     py::class_<IBSimu>(m, "IBSimu")
         .def("set_message_output", [](IBSimu &ib, const std::string &fn){ ib.set_message_output(fn); })
-        .def("set_message_threshold", &IBSimu::set_message_threshold)
+        .def("set_message_threshold", &IBSimu::set_message_threshold, py::arg("type"), py::arg("level"))
         .def("get_message_threshold", &IBSimu::get_message_threshold)
-        .def("set_thread_count",      &IBSimu::set_thread_count)
-        .def("set_rng_type",          &IBSimu::set_rng_type)
+        .def("set_thread_count",      &IBSimu::set_thread_count, py::arg("n"))
+        .def("set_rng_type",          &IBSimu::set_rng_type, py::arg("type"))
         .def("inc_indent",            &IBSimu::inc_indent)
         .def("dec_indent",            &IBSimu::dec_indent)
         .def("output_is_cout",        &IBSimu::output_is_cout);
@@ -1245,26 +1570,36 @@ PYBIND11_MODULE(ibsimu, m) {
     // ParticleDataBase (abstract base with iteration settings)
     // -----------------------------------------------------------------------
     py::class_<ParticleDataBase>(m, "ParticleDataBase")
-        .def("set_accuracy",         &ParticleDataBase::set_accuracy)
-        .def("set_bfield_suppression",&ParticleDataBase::set_bfield_suppression)
-        .def("set_trajectory_handler_callback",
-             &ParticleDataBase::set_trajectory_handler_callback)
-        .def("set_trajectory_end_callback",
-             &ParticleDataBase::set_trajectory_end_callback)
-        .def("set_trajectory_surface_collision_callback",
-             &ParticleDataBase::set_trajectory_surface_collision_callback)
-        .def("set_relativistic",       &ParticleDataBase::set_relativistic)
-        .def("set_surface_collision",  &ParticleDataBase::set_surface_collision)
-        .def("set_polyint",            &ParticleDataBase::set_polyint)
+        .def("set_accuracy",         &ParticleDataBase::set_accuracy, py::arg("epsabs"), py::arg("epsrel"))
+        .def("set_bfield_suppression",&ParticleDataBase::set_bfield_suppression, py::keep_alive<1, 2>())
+        .def("set_trajectory_handler_callback", [](ParticleDataBase &pdb, TrajectoryHandlerCallback *cb){
+            register_callback<TrajectoryHandlerCallback, PyTrajectoryHandlerCallback>(
+                pdb, cb, &ParticleDataBase::set_trajectory_handler_callback);
+        }, py::keep_alive<1, 2>())
+        .def("set_trajectory_end_callback", [](ParticleDataBase &pdb, TrajectoryEndCallback *cb){
+            register_callback<TrajectoryEndCallback, PyTrajectoryEndCallback>(
+                pdb, cb, &ParticleDataBase::set_trajectory_end_callback);
+        }, py::keep_alive<1, 2>())
+        .def("set_trajectory_surface_collision_callback", [](ParticleDataBase &pdb, TrajectorySurfaceCollisionCallback *cb){
+            register_callback<TrajectorySurfaceCollisionCallback, PyTrajectorySurfaceCollisionCallback>(
+                pdb, cb, &ParticleDataBase::set_trajectory_surface_collision_callback);
+        }, py::keep_alive<1, 2>())
+        .def("set_relativistic",       &ParticleDataBase::set_relativistic, py::arg("enable"))
+        .def("set_surface_collision",  &ParticleDataBase::set_surface_collision, py::arg("enable"))
+        .def("set_polyint",            &ParticleDataBase::set_polyint, py::arg("enable"))
         .def("get_polyint",            &ParticleDataBase::get_polyint)
-        .def("set_trajectory_interpolation", &ParticleDataBase::set_trajectory_interpolation)
+        .def("set_trajectory_interpolation", &ParticleDataBase::set_trajectory_interpolation, py::arg("intrp"))
         .def("get_trajectory_interpolation", &ParticleDataBase::get_trajectory_interpolation)
-        .def("set_scharge_deposition", &ParticleDataBase::set_scharge_deposition)
+        .def("set_scharge_deposition", &ParticleDataBase::set_scharge_deposition, py::arg("type"))
         .def("get_scharge_deposition", &ParticleDataBase::get_scharge_deposition)
-        .def("set_max_steps",          &ParticleDataBase::set_max_steps)
-        .def("set_max_time",           &ParticleDataBase::set_max_time)
-        .def("set_save_all_points",    &ParticleDataBase::set_save_all_points)
-        .def("set_save_trajectories",  &ParticleDataBase::set_save_trajectories)
+        .def("set_max_steps",          &ParticleDataBase::set_max_steps, py::arg("maxsteps"))
+        .def("set_max_time",           &ParticleDataBase::set_max_time, py::arg("maxt"))
+        .def("set_save_all_points",    &ParticleDataBase::set_save_all_points, py::arg("enable"))
+        .def("set_save_trajectories",  [](ParticleDataBase &pdb, py::object div){
+            // Accept True/False as well as an integer divisor.
+            pdb.set_save_trajectories(py::isinstance<py::bool_>(div) ? (div.cast<bool>() ? 1 : 0)
+                                                                     : div.cast<uint32_t>());
+        }, py::arg("div"), "Save every div-th trajectory (0 or False: none, 1 or True: all)")
         .def("get_save_trajectories",  &ParticleDataBase::get_save_trajectories)
         .def("set_mirror", [](ParticleDataBase &pdb, py::list mirror){
             bool m[6]; list_to_mirror(mirror, m); pdb.set_mirror(m);
@@ -1275,7 +1610,7 @@ PYBIND11_MODULE(ibsimu, m) {
         })
         .def("get_iteration_number",  &ParticleDataBase::get_iteration_number)
         .def("get_rhosum",            &ParticleDataBase::get_rhosum)
-        .def("set_rhosum",            &ParticleDataBase::set_rhosum)
+        .def("set_rhosum",            &ParticleDataBase::set_rhosum, py::arg("rhosum"))
         .def("get_statistics",        &ParticleDataBase::get_statistics,
              py::return_value_policy::reference_internal)
         .def("geom_mode",             &ParticleDataBase::geom_mode)
@@ -1295,31 +1630,38 @@ PYBIND11_MODULE(ibsimu, m) {
                                          coordinate_axis_e axis, double val,
                                          const std::vector<trajectory_diagnostic_e> &diag){
             pdb.trajectories_at_plane(tdata, axis, val, diag);
-        })
-        .def("build_trajectory_density_field", &ParticleDataBase::build_trajectory_density_field)
+        }, py::arg("tdata"), py::arg("axis"), py::arg("val"), py::arg("diagnostics"),
+           "Collect diagnostics where trajectories cross the plane axis = val")
+        .def("build_trajectory_density_field", &ParticleDataBase::build_trajectory_density_field, py::arg("tdens"))
         .def("clear",                 &ParticleDataBase::clear)
         .def("clear_trajectories",    &ParticleDataBase::clear_trajectories)
         .def("clear_trajectory",      &ParticleDataBase::clear_trajectory)
         .def("reset_trajectories",    &ParticleDataBase::reset_trajectories)
         .def("reset_trajectory",      &ParticleDataBase::reset_trajectory)
-        .def("reserve",               &ParticleDataBase::reserve)
+        .def("reserve",               &ParticleDataBase::reserve, py::arg("size"))
         .def("iterate_trajectories",  [](ParticleDataBase &pdb, MeshScalarField &sc,
                                          const VectorField &ef, const VectorField &bf){
-            py::gil_scoped_release release;
-            pdb.iterate_trajectories(sc, ef, bf);
-        })
+            { py::gil_scoped_release release; pdb.iterate_trajectories(sc, ef, bf); }
+            rethrow_python_error();
+        }, py::arg("scharge"), py::arg("efield"), py::arg("bfield"))
         .def("step_particles",        [](ParticleDataBase &pdb, MeshScalarField &sc,
                                          const VectorField &ef, const VectorField &bf, double dt){
-            py::gil_scoped_release release;
-            pdb.step_particles(sc, ef, bf, dt);
-        })
+            { py::gil_scoped_release release; pdb.step_particles(sc, ef, bf, dt); }
+            rethrow_python_error();
+        }, py::arg("scharge"), py::arg("efield"), py::arg("bfield"), py::arg("dt"))
         .def("save", [](const ParticleDataBase &pdb, const std::string &fn){ pdb.save(fn); });
 
     // -----------------------------------------------------------------------
     // ParticleDataBase2D
     // -----------------------------------------------------------------------
     py::class_<ParticleDataBase2D, ParticleDataBase>(m, "ParticleDataBase2D")
-        .def(py::init<const Geometry &>())
+        .def(py::init<const Geometry &>(), py::arg("geom"))
+        .def(py::init<const ParticleDataBase2D &>())
+        .def(py::init([](const std::string &filename, const Geometry &geom){
+            std::ifstream is(filename);
+            if (!is) throw std::runtime_error("Cannot open file: " + filename);
+            return new ParticleDataBase2D(is, geom);
+        }), py::arg("filename"), py::arg("geom"), "Load a particle database saved with save()")
         .def("particle", [](ParticleDataBase2D &pdb, uint32_t i) -> Particle2D& {
             return pdb.particle(i);
         }, py::return_value_policy::reference_internal)
@@ -1327,19 +1669,32 @@ PYBIND11_MODULE(ibsimu, m) {
             -> const ParticleP2D& { return pdb.trajectory_point(i,j); },
             py::return_value_policy::reference_internal)
         .def("add_particle", [](ParticleDataBase2D &pdb, double IQ, double q, double m,
-                                 const ParticleP2D &x){ pdb.add_particle(IQ, q, m, x); })
-        .def("add_particle", [](ParticleDataBase2D &pdb, const Particle2D &p){ pdb.add_particle(p); })
-        .def("add_2d_beam_with_energy",       &ParticleDataBase2D::add_2d_beam_with_energy)
-        .def("add_2d_beam_with_velocity",     &ParticleDataBase2D::add_2d_beam_with_velocity)
+                                 const ParticleP2D &x){ pdb.add_particle(IQ, q, m, x); },
+             py::arg("IQ"), py::arg("q"), py::arg("m"), py::arg("x"))
+        .def("add_particle", [](ParticleDataBase2D &pdb, const Particle2D &p){ pdb.add_particle(p); }, py::arg("p"))
+        .def("add_2d_beam_with_energy",       &ParticleDataBase2D::add_2d_beam_with_energy,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("E"), py::arg("Tp"), py::arg("Tt"), py::arg("x1"), py::arg("y1"), py::arg("x2"), py::arg("y2"),
+             "N particles, current density J [A/m], charge q [e], mass m [u], energy E [eV], "
+             "parallel/transverse temperatures Tp, Tt [eV], from (x1, y1) to (x2, y2)")
+        .def("add_2d_beam_with_velocity",     &ParticleDataBase2D::add_2d_beam_with_velocity,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("v"), py::arg("dvp"), py::arg("dvt"), py::arg("x1"), py::arg("y1"), py::arg("x2"), py::arg("y2"))
         .def("add_2d_gaussian_beam_with_emittance",
-             &ParticleDataBase2D::add_2d_gaussian_beam_with_emittance)
-        .def("add_2d_KV_beam_with_emittance", &ParticleDataBase2D::add_2d_KV_beam_with_emittance);
+             &ParticleDataBase2D::add_2d_gaussian_beam_with_emittance,
+             py::arg("N"), py::arg("I"), py::arg("q"), py::arg("m"), py::arg("a"), py::arg("b"), py::arg("e"), py::arg("Ex"), py::arg("x0"), py::arg("y0"))
+        .def("add_2d_KV_beam_with_emittance", &ParticleDataBase2D::add_2d_KV_beam_with_emittance,
+             py::arg("N"), py::arg("I"), py::arg("q"), py::arg("m"), py::arg("a"), py::arg("b"), py::arg("e"), py::arg("Ex"), py::arg("x0"), py::arg("y0"));
 
     // -----------------------------------------------------------------------
     // ParticleDataBaseCyl
     // -----------------------------------------------------------------------
     py::class_<ParticleDataBaseCyl, ParticleDataBase>(m, "ParticleDataBaseCyl")
-        .def(py::init<const Geometry &>())
+        .def(py::init<const Geometry &>(), py::arg("geom"))
+        .def(py::init<const ParticleDataBaseCyl &>())
+        .def(py::init([](const std::string &filename, const Geometry &geom){
+            std::ifstream is(filename);
+            if (!is) throw std::runtime_error("Cannot open file: " + filename);
+            return new ParticleDataBaseCyl(is, geom);
+        }), py::arg("filename"), py::arg("geom"), "Load a particle database saved with save()")
         .def("particle", [](ParticleDataBaseCyl &pdb, uint32_t i) -> ParticleCyl& {
             return pdb.particle(i);
         }, py::return_value_policy::reference_internal)
@@ -1347,21 +1702,35 @@ PYBIND11_MODULE(ibsimu, m) {
             -> const ParticlePCyl& { return pdb.trajectory_point(i,j); },
             py::return_value_policy::reference_internal)
         .def("add_particle", [](ParticleDataBaseCyl &pdb, double IQ, double q, double m,
-                                 const ParticlePCyl &x){ pdb.add_particle(IQ, q, m, x); })
-        .def("add_particle", [](ParticleDataBaseCyl &pdb, const ParticleCyl &p){ pdb.add_particle(p); })
-        .def("add_2d_beam_with_energy",       &ParticleDataBaseCyl::add_2d_beam_with_energy)
-        .def("add_2d_beam_with_total_energy", &ParticleDataBaseCyl::add_2d_beam_with_total_energy)
-        .def("add_2d_beam_with_velocity",     &ParticleDataBaseCyl::add_2d_beam_with_velocity)
-        .def("add_2d_full_gaussian_beam",     &ParticleDataBaseCyl::add_2d_full_gaussian_beam)
+                                 const ParticlePCyl &x){ pdb.add_particle(IQ, q, m, x); },
+             py::arg("IQ"), py::arg("q"), py::arg("m"), py::arg("x"))
+        .def("add_particle", [](ParticleDataBaseCyl &pdb, const ParticleCyl &p){ pdb.add_particle(p); }, py::arg("p"))
+        .def("add_2d_beam_with_energy",       &ParticleDataBaseCyl::add_2d_beam_with_energy,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("E"), py::arg("Tp"), py::arg("Tt"), py::arg("x1"), py::arg("y1"), py::arg("x2"), py::arg("y2"),
+             "N particles, current density J [A/m^2], charge q [e], mass m [u], energy E [eV], "
+             "parallel/transverse temperatures Tp, Tt [eV], from (x1, r1) to (x2, r2)")
+        .def("add_2d_beam_with_total_energy", &ParticleDataBaseCyl::add_2d_beam_with_total_energy,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("Etot"), py::arg("epot"), py::arg("Tp"), py::arg("Tt"), py::arg("x1"), py::arg("y1"), py::arg("x2"), py::arg("y2"))
+        .def("add_2d_beam_with_velocity",     &ParticleDataBaseCyl::add_2d_beam_with_velocity,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("v"), py::arg("dvp"), py::arg("dvt"), py::arg("x1"), py::arg("y1"), py::arg("x2"), py::arg("y2"))
+        .def("add_2d_full_gaussian_beam",     &ParticleDataBaseCyl::add_2d_full_gaussian_beam,
+             py::arg("N"), py::arg("I"), py::arg("q"), py::arg("m"), py::arg("Ex"), py::arg("Tp"), py::arg("Tt"), py::arg("x0"), py::arg("dr"))
         .def("add_2d_gaussian_beam_with_emittance",
-             &ParticleDataBaseCyl::add_2d_gaussian_beam_with_emittance)
+             &ParticleDataBaseCyl::add_2d_gaussian_beam_with_emittance,
+             py::arg("N"), py::arg("I"), py::arg("q"), py::arg("m"), py::arg("a"), py::arg("b"), py::arg("e"), py::arg("Ex"), py::arg("x0"))
         .def("export_path_manager_data",      &ParticleDataBaseCyl::export_path_manager_data);
 
     // -----------------------------------------------------------------------
     // ParticleDataBase3D
     // -----------------------------------------------------------------------
     py::class_<ParticleDataBase3D, ParticleDataBase>(m, "ParticleDataBase3D")
-        .def(py::init<const Geometry &>())
+        .def(py::init<const Geometry &>(), py::arg("geom"))
+        .def(py::init<const ParticleDataBase3D &>())
+        .def(py::init([](const std::string &filename, const Geometry &geom){
+            std::ifstream is(filename);
+            if (!is) throw std::runtime_error("Cannot open file: " + filename);
+            return new ParticleDataBase3D(is, geom);
+        }), py::arg("filename"), py::arg("geom"), "Load a particle database saved with save()")
         .def("particle", [](ParticleDataBase3D &pdb, uint32_t i) -> Particle3D& {
             return pdb.particle(i);
         }, py::return_value_policy::reference_internal)
@@ -1369,24 +1738,35 @@ PYBIND11_MODULE(ibsimu, m) {
             -> const ParticleP3D& { return pdb.trajectory_point(i,j); },
             py::return_value_policy::reference_internal)
         .def("add_particle", [](ParticleDataBase3D &pdb, double IQ, double q, double m,
-                                 const ParticleP3D &x){ pdb.add_particle(IQ, q, m, x); })
-        .def("add_particle", [](ParticleDataBase3D &pdb, const Particle3D &p){ pdb.add_particle(p); })
+                                 const ParticleP3D &x){ pdb.add_particle(IQ, q, m, x); },
+             py::arg("IQ"), py::arg("q"), py::arg("m"), py::arg("x"))
+        .def("add_particle", [](ParticleDataBase3D &pdb, const Particle3D &p){ pdb.add_particle(p); }, py::arg("p"))
         .def("add_cylindrical_beam_with_total_energy",
-             &ParticleDataBase3D::add_cylindrical_beam_with_total_energy)
+             &ParticleDataBase3D::add_cylindrical_beam_with_total_energy,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("Etot"), py::arg("epot"), py::arg("Tp"), py::arg("Tt"), py::arg("c"), py::arg("dir1"), py::arg("dir2"), py::arg("r"))
         .def("add_cylindrical_beam_with_energy",
-             &ParticleDataBase3D::add_cylindrical_beam_with_energy)
+             &ParticleDataBase3D::add_cylindrical_beam_with_energy,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("E"), py::arg("Tp"), py::arg("Tt"), py::arg("c"), py::arg("dir1"), py::arg("dir2"), py::arg("r"),
+             "N particles, current density J [A/m^2], charge q [e], mass m [u], energy E [eV], "
+             "temperatures Tp, Tt [eV], disc of radius r centred at c spanned by dir1, dir2")
         .def("add_cylindrical_beam_with_velocity",
-             &ParticleDataBase3D::add_cylindrical_beam_with_velocity)
+             &ParticleDataBase3D::add_cylindrical_beam_with_velocity,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("v"), py::arg("dvp"), py::arg("dvt"), py::arg("c"), py::arg("dir1"), py::arg("dir2"), py::arg("r"))
         .def("add_rectangular_beam_with_energy",
-             &ParticleDataBase3D::add_rectangular_beam_with_energy)
+             &ParticleDataBase3D::add_rectangular_beam_with_energy,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("E"), py::arg("Tp"), py::arg("Tt"), py::arg("c"), py::arg("dir1"), py::arg("dir2"), py::arg("size1"), py::arg("size2"))
         .def("add_rectangular_beam_with_velocity",
-             &ParticleDataBase3D::add_rectangular_beam_with_velocity)
+             &ParticleDataBase3D::add_rectangular_beam_with_velocity,
+             py::arg("N"), py::arg("J"), py::arg("q"), py::arg("m"), py::arg("v"), py::arg("dvp"), py::arg("dvt"), py::arg("c"), py::arg("dir1"), py::arg("dir2"), py::arg("size1"), py::arg("size2"))
         .def("add_3d_KV_beam_with_emittance",
-             &ParticleDataBase3D::add_3d_KV_beam_with_emittance)
+             &ParticleDataBase3D::add_3d_KV_beam_with_emittance,
+             py::arg("N"), py::arg("I"), py::arg("q"), py::arg("m"), py::arg("E0"), py::arg("a1"), py::arg("b1"), py::arg("e1"), py::arg("a2"), py::arg("b2"), py::arg("e2"), py::arg("c"), py::arg("dir1"), py::arg("dir2"))
         .def("add_3d_waterbag_beam_with_emittance",
-             &ParticleDataBase3D::add_3d_waterbag_beam_with_emittance)
+             &ParticleDataBase3D::add_3d_waterbag_beam_with_emittance,
+             py::arg("N"), py::arg("I"), py::arg("q"), py::arg("m"), py::arg("E0"), py::arg("a1"), py::arg("b1"), py::arg("e1"), py::arg("a2"), py::arg("b2"), py::arg("e2"), py::arg("c"), py::arg("dir1"), py::arg("dir2"))
         .def("add_3d_gaussian_beam_with_emittance",
-             &ParticleDataBase3D::add_3d_gaussian_beam_with_emittance)
+             &ParticleDataBase3D::add_3d_gaussian_beam_with_emittance,
+             py::arg("N"), py::arg("I"), py::arg("q"), py::arg("m"), py::arg("E0"), py::arg("a1"), py::arg("b1"), py::arg("e1"), py::arg("a2"), py::arg("b2"), py::arg("e2"), py::arg("c"), py::arg("dir1"), py::arg("dir2"))
         .def("trajectories_at_free_plane", [](const ParticleDataBase3D &pdb,
                                               TrajectoryDiagnosticData &tdata,
                                               const Vec3D &c, const Vec3D &o, const Vec3D &p,
@@ -1404,27 +1784,34 @@ PYBIND11_MODULE(ibsimu, m) {
     // Plotting / diagnostics
     // -----------------------------------------------------------------------
     py::class_<Plotter, std::unique_ptr<Plotter, py::nodelete>>(m, "Plotter")
-        .def("set_size",      &Plotter::set_size)
-        .def("set_font_size", &Plotter::set_font_size)
-        .def("set_ranges",    &Plotter::set_ranges)
+        .def("set_size",      &Plotter::set_size, py::arg("width"), py::arg("height"))
+        .def("set_font_size", &Plotter::set_font_size, py::arg("size"))
+        .def("set_ranges",    &Plotter::set_ranges, py::arg("xmin"), py::arg("ymin"), py::arg("xmax"), py::arg("ymax"))
         .def("get_ranges",    [](Plotter &p){
             double xmin, ymin, xmax, ymax; p.get_ranges(xmin, ymin, xmax, ymax);
             return py::make_tuple(xmin, ymin, xmax, ymax);
         })
-        .def("plot_png",      &Plotter::plot_png)
+        .def("plot_png",      &Plotter::plot_png, py::arg("filename"))
 #ifdef CAIRO_HAS_PS_SURFACE
-        .def("plot_eps",      &Plotter::plot_eps)
+        .def("plot_eps",      &Plotter::plot_eps, py::arg("filename"))
 #endif
 #ifdef CAIRO_HAS_PDF_SURFACE
-        .def("plot_pdf",      &Plotter::plot_pdf)
+        .def("plot_pdf",      &Plotter::plot_pdf, py::arg("filename"))
 #endif
 #ifdef CAIRO_HAS_SVG_SURFACE
-        .def("plot_svg",      &Plotter::plot_svg)
+        .def("plot_svg",      &Plotter::plot_svg, py::arg("filename"))
 #endif
         ;
 
     py::class_<MeshColormap>(m, "MeshColormap")
-        .def("set_zscale", &MeshColormap::set_zscale);
+        .def("set_zscale", &MeshColormap::set_zscale, py::arg("zscale"))
+        .def("get_zscale", &MeshColormap::get_zscale)
+        .def("set_interpolation", &MeshColormap::set_interpolation, py::arg("interpolation"))
+        .def("get_interpolation", &MeshColormap::get_interpolation)
+        .def("set_zrange", &MeshColormap::set_zrange, py::arg("min"), py::arg("max"))
+        .def("get_zrange", [](const MeshColormap &c){
+            double mn, mx; c.get_zrange(mn, mx); return py::make_tuple(mn, mx);
+        });
 
     py::class_<FieldGraph, MeshColormap>(m, "FieldGraph")
         .def("set_zrange", &FieldGraph::set_zrange);
@@ -1438,17 +1825,17 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("set_trajdens",          &GeomPlotter::set_trajdens, py::keep_alive<1, 2>())
         .def("set_particle_database", &GeomPlotter::set_particle_database, py::keep_alive<1, 2>())
         .def("set_particledatabase",  &GeomPlotter::set_particledatabase, py::keep_alive<1, 2>())
-        .def("set_eqlines_manual",    &GeomPlotter::set_eqlines_manual)
-        .def("set_eqlines_auto",      &GeomPlotter::set_eqlines_auto)
-        .def("enable_colormap_legend", &GeomPlotter::enable_colormap_legend)
+        .def("set_eqlines_manual",    &GeomPlotter::set_eqlines_manual, py::arg("pot"))
+        .def("set_eqlines_auto",      &GeomPlotter::set_eqlines_auto, py::arg("N"))
+        .def("enable_colormap_legend", &GeomPlotter::enable_colormap_legend, py::arg("enable"))
         .def("set_particle_div",      [](GeomPlotter &g, uint32_t div, uint32_t offset){
             g.set_particle_div(div, offset);
         }, py::arg("div"), py::arg("offset") = 0)
-        .def("set_qm_discretation",   &GeomPlotter::set_qm_discretation)
-        .def("set_mesh",              &GeomPlotter::set_mesh)
+        .def("set_qm_discretation",   &GeomPlotter::set_qm_discretation, py::arg("enable"))
+        .def("set_mesh",              &GeomPlotter::set_mesh, py::arg("enable"))
         .def("set_view",              &GeomPlotter::set_view, py::arg("view"), py::arg("level") = -1)
-        .def("set_view_si",           &GeomPlotter::set_view_si)
-        .def("set_fieldgraph_plot",   &GeomPlotter::set_fieldgraph_plot)
+        .def("set_view_si",           &GeomPlotter::set_view_si, py::arg("view"), py::arg("level"))
+        .def("set_fieldgraph_plot",   &GeomPlotter::set_fieldgraph_plot, py::arg("fieldplot"))
         .def("fieldgraph", (FieldGraph* (GeomPlotter::*)()) &GeomPlotter::fieldgraph,
              py::return_value_policy::reference_internal);
 
@@ -1461,7 +1848,19 @@ PYBIND11_MODULE(ibsimu, m) {
                       particle_diag_plot_type_e, trajectory_diagnostic_e, trajectory_diagnostic_e>(),
              py::arg("geom"), py::arg("pdb"), py::arg("c"), py::arg("o"), py::arg("p"),
              py::arg("type"), py::arg("diagx"), py::arg("diagy")=DIAG_NONE)
-        .def("calculate_emittance", &ParticleDiagPlotter::calculate_emittance);
+        .def("set_emittance_ellipse", &ParticleDiagPlotter::set_emittance_ellipse, py::arg("enable"))
+        .def("set_view", &ParticleDiagPlotter::set_view, py::arg("axis"), py::arg("level"))
+        .def("set_plot", &ParticleDiagPlotter::set_plot, py::arg("type"), py::arg("diagx"), py::arg("diagy"))
+        .def("set_histogram_n", &ParticleDiagPlotter::set_histogram_n, py::arg("n"))
+        .def("set_histogram_m", &ParticleDiagPlotter::set_histogram_m, py::arg("m"))
+        .def("set_histogram_accumulation", &ParticleDiagPlotter::set_histogram_accumulation, py::arg("accumulation"))
+        .def("set_histogram_style", &ParticleDiagPlotter::set_histogram_style, py::arg("style"))
+        .def("set_colormap_interpolation", &ParticleDiagPlotter::set_colormap_interpolation, py::arg("interpolation"))
+        .def("set_dot_size", &ParticleDiagPlotter::set_dot_size, py::arg("size"))
+        .def("get_isum", &ParticleDiagPlotter::get_isum, "Total current of the plotted particles")
+        .def("export_data", &ParticleDiagPlotter::export_data, py::arg("filename"))
+        .def("calculate_emittance", &ParticleDiagPlotter::calculate_emittance,
+             py::return_value_policy::reference_internal);
 
     py::class_<FieldDiagPlotter, Plotter>(m, "FieldDiagPlotter")
         .def(py::init<const Geometry &>())
@@ -1470,13 +1869,13 @@ PYBIND11_MODULE(ibsimu, m) {
         .def("set_scharge",  &FieldDiagPlotter::set_scharge)
         .def("set_trajdens", &FieldDiagPlotter::set_trajdens)
         .def("set_bfield",   &FieldDiagPlotter::set_bfield)
-        .def("set_coordinates", &FieldDiagPlotter::set_coordinates)
+        .def("set_coordinates", &FieldDiagPlotter::set_coordinates, py::arg("N"), py::arg("x1"), py::arg("x2"))
         .def("set_diagnostic", [](FieldDiagPlotter &p, py::list diag, py::list loc){
              field_diag_type_e d[2] = { diag[0].cast<field_diag_type_e>(), diag[1].cast<field_diag_type_e>() };
              field_loc_type_e l[2] = { loc[0].cast<field_loc_type_e>(), loc[1].cast<field_loc_type_e>() };
              p.set_diagnostic(d, l);
         })
-        .def("export_data",  &FieldDiagPlotter::export_data);
+        .def("export_data",  &FieldDiagPlotter::export_data, py::arg("filename"));
 
     // -----------------------------------------------------------------------
     // Free functions - polynomial solvers
