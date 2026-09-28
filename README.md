@@ -79,7 +79,7 @@ sim = ibsimu.Simulation(mode="2d", size=(101, 41, 1), h=1e-3,
                         solids={7: lambda x, y, z: x > 80e-3}, boundaries={7: -10e3})
 out = sim.run()
 out.info()
-epot = out.evaluate("epot")
+epot = out.evaluate("epot")   # plots directly, also with the plasma-plots accessors
 ```
 
 ### Running Tests and Examples

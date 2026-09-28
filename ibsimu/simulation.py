@@ -80,16 +80,49 @@ _BOUND_TYPES = {
     "dirichlet": _core.BOUND_DIRICHLET,
 }
 
-# Field keys understood by SimulationOutput.evaluate(), with units.
+# Field keys understood by SimulationOutput.evaluate(): (label, units).  The
+# attributes follow the plasma-plots conventions (``label`` in mathtext,
+# ``units``; coordinates carry ``long_name`` and ``units``).
 _FIELD_KEYS = {
-    "epot": "V",
-    "scharge": "C/m^3",
-    "efield": "V/m",
-    "bfield": "T",
-    "trajdens": "A/m^2",
-    "solid": "",
+    "epot": (r"$\phi$", "V"),
+    "scharge": (r"$\rho$", "C/m$^3$"),
+    "efield": (r"$\mathbf{E}$", "V/m"),
+    "bfield": (r"$\mathbf{B}$", "T"),
+    "trajdens": (r"$J$", "A/m$^2$"),
+    "solid": ("solid", ""),
 }
-_KEYS = tuple(_FIELD_KEYS) + ("trajectories",)
+_KEYS = tuple(_FIELD_KEYS) + ("trajectories", "markers")
+
+# Labels and units of trajectory coordinates and plane diagnostics.
+_QUANTITIES = {
+    "t": ("$t$", "s"),
+    "x": ("$x$", "m"),
+    "y": ("$y$", "m"),
+    "r": ("$r$", "m"),
+    "z": ("$z$", "m"),
+    "vx": ("$v_x$", "m/s"),
+    "vy": ("$v_y$", "m/s"),
+    "vr": ("$v_r$", "m/s"),
+    "vz": ("$v_z$", "m/s"),
+    "w": (r"$\omega$", "rad/s"),
+    "vtheta": (r"$v_\theta$", "m/s"),
+    "xp": ("$x'$", "rad"),
+    "yp": ("$y'$", "rad"),
+    "rp": ("$r'$", "rad"),
+    "zp": ("$z'$", "rad"),
+    "ap": (r"$\alpha'$", "rad"),
+    "curr": ("$I$", "A"),
+    "ek": ("$E_k$", "eV"),
+    "qm": ("$q/m$", "C/kg"),
+    "charge": ("$q$", "C"),
+    "mass": ("$m$", "kg"),
+    "no": ("particle", ""),
+}
+
+
+def _quantity_attrs(name: str) -> dict[str, str]:
+    label, units = _QUANTITIES.get(name, (name, ""))
+    return {"label": label, "long_name": label, "units": units}
 
 
 def _mode_of(mode) -> _core.GeometryMode:
@@ -229,6 +262,9 @@ class Simulation:
         List of six ``ibsimu.FIELD_*`` extrapolation modes for the electric field.
     threads
         Number of worker threads (``None`` keeps the library default).
+    name
+        Run name, stored as ``attrs["run"]`` on the output arrays (plasma-plots
+        uses it as figure title).
     """
 
     def __init__(
@@ -249,6 +285,7 @@ class Simulation:
         initial_plasma: Mapping[str, Any] | None = None,
         efield_extrapolation: Sequence[Any] | None = None,
         threads: int | None = None,
+        name: str = "",
     ):
         self.mode = _mode_of(mode)
         if self.mode not in _PDB_CLASSES:
@@ -269,6 +306,7 @@ class Simulation:
             list(efield_extrapolation) if efield_extrapolation else None
         )
         self.threads = threads
+        self.name = name
 
         for n in self.solids:
             if n < 7:
@@ -414,6 +452,7 @@ class Simulation:
             efield=efield,
             bfield=bfield,
             pdb=pdb,
+            name=self.name,
         )
 
         prev_epot = None
@@ -485,8 +524,10 @@ class SimulationOutput:
         solver=None,
         efield=None,
         bfield=None,
+        name: str = "",
     ):
         self.simulation = simulation
+        self.name = name
         self.geom = geom
         self.solver = solver
         self.epot = epot
@@ -514,6 +555,18 @@ class SimulationOutput:
     def coords(self) -> dict[str, np.ndarray]:
         """Node coordinates [m] keyed by axis name."""
         return dict(zip(self.dims, self.geom.node_coordinates()))
+
+    def _xr_coords(self, xr) -> dict[str, Any]:
+        return {
+            d: xr.DataArray(c, dims=d, attrs=_quantity_attrs(d))
+            for d, c in self.coords().items()
+        }
+
+    def _attrs(self, label: str, units: str, **extra) -> dict[str, Any]:
+        attrs = {"label": label, "long_name": label, "units": units, **extra}
+        if self.name:
+            attrs["run"] = self.name
+        return attrs
 
     def keys(self) -> tuple[str, ...]:
         """Keys accepted by :meth:`evaluate`."""
@@ -582,20 +635,25 @@ class SimulationOutput:
         node coordinates in metres; vector fields carry an extra ``component``
         dimension. ``"trajectories"`` has dimensions ``(particle, point, coord)``
         and is NaN padded to the longest trajectory; use
-        ``da.sel(coord="x")`` to pick a coordinate.
+        ``da.sel(coord="x")`` to pick a coordinate. ``"markers"`` is an
+        :class:`xarray.Dataset` with one variable per coordinate over
+        ``(t, marker)``, interpolated onto a common time grid (``nt`` points,
+        default 200), which is the layout plasma-plots expects for marker plots.
         """
         xr = _xarray()
         key = key.lower()
         if key == "trajectories":
             return self._trajectories(xr, **kwargs)
+        if key == "markers":
+            return self._markers(xr, **kwargs)
         if key not in _FIELD_KEYS:
             raise KeyError(f"Unknown key {key!r}; available: {', '.join(self.keys())}")
         if kwargs:
             raise TypeError(f"evaluate({key!r}) takes no keyword arguments")
 
-        coords = self.coords()
+        coords = self._xr_coords(xr)
         dims = self.dims
-        attrs = {"units": _FIELD_KEYS[key]}
+        attrs = self._attrs(*_FIELD_KEYS[key])
         if key == "epot":
             data = self.epot.numpy().copy()
         elif key == "scharge":
@@ -614,10 +672,13 @@ class SimulationOutput:
             coords = {**coords, "component": ["x", "y", "z"]}
         return xr.DataArray(data, dims=dims, coords=coords, name=key, attrs=attrs)
 
+    def _particle_trajectories(self, particles):
+        idx = list(range(self.pdb.size())) if particles is None else list(particles)
+        return idx, [self.pdb.particle(i).trajectory() for i in idx]
+
     def _trajectories(self, xr, particles: Sequence[int] | None = None):
         names = _TRAJ_COORDS[self.mode]
-        idx = list(range(self.pdb.size())) if particles is None else list(particles)
-        trajs = [self.pdb.particle(i).trajectory() for i in idx]
+        idx, trajs = self._particle_trajectories(particles)
         npoints = max((t.shape[0] for t in trajs), default=0)
         data = np.full((len(idx), npoints, len(names)), np.nan)
         for n, t in enumerate(trajs):
@@ -627,16 +688,46 @@ class SimulationOutput:
             dims=("particle", "point", "coord"),
             coords={"particle": idx, "point": np.arange(npoints), "coord": list(names)},
             name="trajectories",
-            attrs={
-                "description": "SI units; NaN padded beyond the end of each trajectory"
+            attrs=self._attrs(
+                "trajectories",
+                "",
+                description="SI units; NaN padded beyond the end of each trajectory",
+            ),
+        )
+
+    def _markers(self, xr, nt: int = 200, particles: Sequence[int] | None = None):
+        names = _TRAJ_COORDS[self.mode]
+        idx, trajs = self._particle_trajectories(particles)
+        t_end = max((float(t[-1, 0]) for t in trajs if t.shape[0]), default=0.0)
+        tgrid = np.linspace(0.0, t_end, int(nt))
+        data = {name: np.full((len(tgrid), len(idx)), np.nan) for name in names[1:]}
+        for n, t in enumerate(trajs):
+            if t.shape[0] == 0:
+                continue
+            for c, name in enumerate(names[1:], start=1):
+                # Interpolate along the flight time; NaN after the particle ended.
+                data[name][:, n] = np.interp(tgrid, t[:, 0], t[:, c], right=np.nan)
+        return xr.Dataset(
+            {
+                name: (("t", "marker"), arr, _quantity_attrs(name))
+                for name, arr in data.items()
             },
+            coords={
+                "t": xr.DataArray(tgrid, dims="t", attrs=_quantity_attrs("t")),
+                "marker": idx,
+            },
+            attrs=self._attrs(
+                "markers",
+                "",
+                description="trajectories interpolated on a common time grid",
+            ),
         )
 
     def diagnostics(self, axis, value: float, diagnostics: Sequence[Any]):
         """Trajectory crossings of the plane ``axis = value`` as an :class:`xarray.Dataset`.
 
         ``diagnostics`` is a list of ``ibsimu.DIAG_*`` values; the variables are
-        named after them (``DIAG_Y`` -> ``"y"``).
+        named after them (``DIAG_Y`` -> ``"y"``) and share the ``marker`` dimension.
         """
         xr = _xarray()
         diag = list(diagnostics)
@@ -645,8 +736,11 @@ class SimulationOutput:
         data_vars = {}
         for j, d in enumerate(diag):
             name = str(d).split(".")[-1].removeprefix("DIAG_").lower()
-            data_vars[name] = ("particle", tdata.column(j).data())
-        return xr.Dataset(data_vars, attrs={"axis": str(axis), "value": float(value)})
+            data_vars[name] = ("marker", tdata.column(j).data(), _quantity_attrs(name))
+        attrs = self._attrs("diagnostics", "", axis=str(axis), value=float(value))
+        return xr.Dataset(
+            data_vars, coords={"marker": np.arange(tdata.traj_size())}, attrs=attrs
+        )
 
     # -- persistence ---------------------------------------------------------------
 
@@ -658,6 +752,7 @@ class SimulationOutput:
         self.scharge.save(os.path.join(directory, "scharge.dat"))
         self.pdb.save(os.path.join(directory, "pdb.dat"))
         meta = {
+            "name": self.name,
             "mode": _MODE_NAMES[self.mode],
             "iterations": self.iterations,
             "wall_time": self.wall_time,
@@ -675,7 +770,14 @@ class SimulationOutput:
         epot = _core.EpotField(os.path.join(directory, "epot.dat"), geom)
         scharge = _core.MeshScalarField(os.path.join(directory, "scharge.dat"))
         pdb = _PDB_CLASSES[geom.geom_mode()](os.path.join(directory, "pdb.dat"), geom)
-        out = cls(None, geom=geom, epot=epot, scharge=scharge, pdb=pdb)
+        out = cls(
+            None,
+            geom=geom,
+            epot=epot,
+            scharge=scharge,
+            pdb=pdb,
+            name=meta.get("name", ""),
+        )
         out.history = meta.get("history", [])
         out.iterations = meta.get("iterations", 0)
         out.wall_time = meta.get("wall_time", float("nan"))

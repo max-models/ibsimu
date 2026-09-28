@@ -213,3 +213,27 @@ def test_plasma_model_applied_from_second_iteration():
     out = sim.run(iterations=3, callback=lambda i, o: seen.append(i), verbose=False)
     assert seen == [0, 1, 2]
     assert out.evaluate("epot").max() <= 5.0 + 1e-9
+
+
+def test_markers_dataset_on_common_time_grid(out):
+    mk = out.evaluate("markers", nt=50)
+    assert isinstance(mk, xr.Dataset)
+    assert set(mk.data_vars) == {"x", "vx", "r", "vr", "w"}
+    assert mk["x"].dims == ("t", "marker") and mk["x"].shape == (50, 30)
+    assert mk["x"].attrs["units"] == "m" and mk.coords["t"].attrs["units"] == "s"
+    assert float(mk["x"].isel(t=0).max()) == 0.0
+    # Every particle ends at some time: NaN afterwards, finite before.
+    assert np.isnan(mk["x"].isel(t=-1)).any() or float(mk["x"].isel(t=-1).min()) > 0.0
+    assert not np.isnan(mk["x"].isel(t=0)).any()
+    sub = out.evaluate("markers", nt=10, particles=[1, 2])
+    assert list(sub.coords["marker"].values) == [1, 2]
+
+
+def test_output_attrs_follow_plasma_plots_conventions():
+    out = lens_simulation(name="lens run").run(verbose=False)
+    epot = out.evaluate("epot")
+    assert epot.attrs["run"] == "lens run"
+    assert epot.attrs["units"] == "V" and epot.attrs["label"]
+    assert epot.coords["r"].attrs == {"label": "$r$", "long_name": "$r$", "units": "m"}
+    ds = out.diagnostics(ibsimu.AXIS_X, 55e-3, [ibsimu.DIAG_RP, ibsimu.DIAG_CURR])
+    assert ds["rp"].dims == ("marker",) and ds["curr"].attrs["units"] == "A"
