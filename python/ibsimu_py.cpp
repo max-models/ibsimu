@@ -329,6 +329,41 @@ static void vector_field_from_numpy(MeshVectorField &f,
             }
 }
 
+// Evaluate a field at every node of a mesh (x index fastest, see above).
+template <typename F, typename Store>
+static void sample_on_mesh(const Mesh &m, const F &f, Store store) {
+    const uint32_t nx = m.size(0), ny = m.size(1);
+    for (uint32_t n = 0; n < m.nodecount(); n++) {
+        uint32_t i = n % nx, j = (n / nx) % ny, k = n / (nx * ny);
+        Vec3D x(m.origo(0) + i*m.h(), m.origo(1) + j*m.h(), m.origo(2) + k*m.h());
+        store(n, f(x));
+    }
+}
+
+static py::array_t<double> scalar_field_sample(const ScalarField &f, const Mesh &m) {
+    py::array_t<double> arr(mesh_shape(m), mesh_strides(m, sizeof(double)));
+    double *out = arr.mutable_data();
+    {
+        py::gil_scoped_release release;
+        sample_on_mesh(m, f, [&](uint32_t n, double v){ out[n] = v; });
+    }
+    return arr;
+}
+
+static py::array_t<double> vector_field_sample(const VectorField &f, const Mesh &m) {
+    std::vector<py::ssize_t> shape = mesh_shape(m);
+    shape.push_back(3);
+    py::array_t<double> arr(shape, mesh_strides(m, sizeof(double), 3));
+    double *out = arr.mutable_data();
+    {
+        py::gil_scoped_release release;
+        sample_on_mesh(m, f, [&](uint32_t n, const Vec3D &v){
+            out[3*n] = v[0]; out[3*n+1] = v[1]; out[3*n+2] = v[2];
+        });
+    }
+    return arr;
+}
+
 // Trajectory of one particle as an (npoints, ncoord) array.
 template <typename P, typename PP>
 static py::array_t<double> trajectory_array(const P &p) {
@@ -347,7 +382,7 @@ static py::array_t<double> vector_to_numpy(const std::vector<double> &v) {
 }
 
 // ===========================================================================
-PYBIND11_MODULE(ibsimu, m) {
+PYBIND11_MODULE(_core, m) {
     m.doc() = "Python wrapper for IBSimu";
 
     // -----------------------------------------------------------------------
@@ -877,10 +912,14 @@ PYBIND11_MODULE(ibsimu, m) {
     py::class_<Field>(m, "Field");
 
     py::class_<ScalarField, Field>(m, "ScalarField")
-        .def("__call__", [](const ScalarField &f, const Vec3D &x){ return f(x); });
+        .def("__call__", [](const ScalarField &f, const Vec3D &x){ return f(x); })
+        .def("sample", &scalar_field_sample, py::arg("mesh"),
+             "Evaluate the field at every node of mesh; array shaped like mesh.shape()");
 
     py::class_<VectorField, Field>(m, "VectorField")
-        .def("__call__", [](const VectorField &f, const Vec3D &x){ return f(x); });
+        .def("__call__", [](const VectorField &f, const Vec3D &x){ return f(x); })
+        .def("sample", &vector_field_sample, py::arg("mesh"),
+             "Evaluate the field at every node of mesh; array shaped mesh.shape() + (3,)");
 
     // -----------------------------------------------------------------------
     // MeshScalarField

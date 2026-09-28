@@ -57,6 +57,7 @@ __pycache__/
 *.pyd
 compile
 ibsimu.cpython-*.so
+ibsimu/_core*.so
 *.egg-info/
 src/libibsimu-*.la
 src/stamp-h1

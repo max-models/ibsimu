@@ -72,6 +72,16 @@ solver.solve(epot, scharge)
 print(epot.numpy().shape)
 ```
 
+Or declaratively, with results as xarray objects:
+
+```python
+sim = ibsimu.Simulation(mode="2d", size=(101, 41, 1), h=1e-3,
+                        solids={7: lambda x, y, z: x > 80e-3}, boundaries={7: -10e3})
+out = sim.run()
+out.info()
+epot = out.evaluate("epot")
+```
+
 ### Running Tests and Examples
 
 You can find more complex examples in the `examples_py/` directory:
