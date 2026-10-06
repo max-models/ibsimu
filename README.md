@@ -39,8 +39,12 @@ The Python API is built using `pybind11`. To install it from the source director
 ```bash
 # Ensure the C++ library is built first (see above)
 export LD_LIBRARY_PATH=$(pwd)/src/.libs
-LDFLAGS="-L$(pwd)/src/.libs" pip install .
+LDFLAGS="-L$(pwd)/src/.libs" pip install -e ".[dev,examples]"
 ```
+
+See [PYTHON.md](PYTHON.md) for the full guide to the Python interface,
+including macOS notes, numpy access to fields and trajectories, callbacks and
+file I/O.
 
 ## Running the Python API
 
@@ -53,7 +57,9 @@ import ibsimu
 
 # Create a 2D geometry
 h = 1e-3
-geom = ibsimu.Geometry(ibsimu.MODE_2D, ibsimu.Int3D(101, 41, 1), ibsimu.Vec3D(0, 0, 0), h)
+geom = ibsimu.Geometry(
+    ibsimu.MODE_2D, ibsimu.Int3D(101, 41, 1), ibsimu.Vec3D(0, 0, 0), h
+)
 geom.build_mesh()
 
 # Define fields and solvers
@@ -64,7 +70,23 @@ solver = ibsimu.EpotGSSolver(geom)
 # Solve Poisson's equation
 solver.solve(epot, scharge)
 
-print("Simulation complete.")
+# Node data as a numpy array
+print(epot.numpy().shape)
+```
+
+Or declaratively, with results as xarray objects:
+
+```python
+sim = ibsimu.Simulation(
+    mode="2d",
+    size=(101, 41, 1),
+    h=1e-3,
+    solids={7: lambda x, y, z: x > 80e-3},
+    boundaries={7: -10e3},
+)
+out = sim.run()
+out.info()
+epot = out.evaluate("epot")  # plots directly, also with the plasma-plots accessors
 ```
 
 ### Running Tests and Examples

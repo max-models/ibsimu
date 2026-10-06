@@ -1,3 +1,5 @@
+"""Python port of tests/plasma2d.cpp: positive ion extraction with a plasma model."""
+
 import ibsimu
 
 
@@ -14,7 +16,7 @@ def solid2(x, y, z):
     return x >= 10.0e-3 and y >= 1.5e-3 and y >= 12.0e-3 - x
 
 
-def test():
+def run_plasma2d():
     # Geometry
     geom = ibsimu.Geometry(
         ibsimu.MODE_2D, ibsimu.Int3D(76, 45, 1), ibsimu.Vec3D(0, 0, 0), 1.6e-4
@@ -91,7 +93,7 @@ def test():
         emit = pp.calculate_emittance()
         conv.evaluate_iteration()
 
-    conv.print_history("plasma2d_conv_py.dat")
+    conv.print_history("examples_py/plasma2d_conv.dat")
 
     pplotter1 = ibsimu.ParticleDiagPlotter(
         geom,
@@ -104,7 +106,7 @@ def test():
     )
     pplotter1.set_font_size(20)
     pplotter1.set_size(800, 600)
-    pplotter1.plot_png("plasma2d_emit1_py.png")
+    pplotter1.plot_png("examples_py/plasma2d_emit1.png")
 
     tdens = ibsimu.MeshScalarField(geom)
     pdb.build_trajectory_density_field(tdens)
@@ -118,8 +120,8 @@ def test():
     gplotter.set_trajdens(tdens)
     gplotter.set_fieldgraph_plot(ibsimu.FIELD_TRAJDENS)
     gplotter.fieldgraph().set_zscale(ibsimu.ZSCALE_RELLOG)
-    gplotter.plot_png("plasma2d_py.png")
+    gplotter.plot_png("examples_py/plasma2d.png")
 
 
 if __name__ == "__main__":
-    test()
+    run_plasma2d()

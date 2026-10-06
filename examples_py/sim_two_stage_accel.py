@@ -1,6 +1,7 @@
-import ibsimu
 import matplotlib.pyplot as plt
 import numpy as np
+
+import ibsimu
 
 
 def run_simulation():
@@ -91,13 +92,10 @@ def run_simulation():
     plt.figure(figsize=(12, 16))
 
     # 5.1 Potential Color Plot
-    nx, ny = geom.size(0), geom.size(1)
-    pot_map = np.zeros((ny, nx))
-    ef_map = np.zeros((ny, nx))
-    for j in range(ny):
-        for i in range(nx):
-            pot_map[j, i] = epot.get3(i, j, 0)
-            ef_map[j, i] = efield(ibsimu.Vec3D(i * h, j * h, 0)).norm2()
+    # Node data as (nx, n{y|r}) arrays; transpose for imshow's (rows, cols)
+    pot_map = epot.numpy().T
+    xs, ys = geom.node_coordinates()
+    ef_map = np.array([[efield(ibsimu.Vec3D(x, y, 0)).norm2() for x in xs] for y in ys])
 
     ext = [
         geom.origo(0) * 1000,
@@ -132,14 +130,8 @@ def run_simulation():
     num_particles = pdb.size()
     step = max(1, num_particles // 50)
     for i in range(0, num_particles, step):
-        p = pdb.particle(i)
-        # Get trajectory points
-        tx = []
-        ty = []
-        for j in range(p.traj_size()):
-            pt = p.traj(j)
-            tx.append(pt.x() * 1000)
-            ty.append(pt.y() * 1000)
+        traj = pdb.particle(i).trajectory() * 1000  # mm
+        tx, ty = traj[:, ibsimu.PARTICLE_X], traj[:, ibsimu.PARTICLE_Y]
         plt.plot(tx, ty, color="blue", alpha=0.3, linewidth=0.5)
 
     plt.xlim(ext[0], ext[1])

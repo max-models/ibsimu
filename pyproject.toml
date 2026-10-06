@@ -9,17 +9,16 @@ authors = [
     { name = "Taneli Kalvas", email = "taneli.kalvas@jyu.fi" },
 ]
 description = "Python wrapper for IBSimu"
-readme = "README"
+readme = "PYTHON.md"
 requires-python = ">=3.8"
 dependencies = [
-    "pybind11",
     "numpy",
-    "matplotlib",
-    "pyvista",
-    "scipy",
-    "ruff",
-    "pytest",
+    "xarray",
 ]
 
+[project.optional-dependencies]
+examples = ["matplotlib", "pyvista", "scipy"]
+dev = ["pytest", "ruff", "numpy", "matplotlib"]
+
 [tool.setuptools]
-py-modules = []
+packages = ["ibsimu"]

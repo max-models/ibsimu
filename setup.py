@@ -75,7 +75,7 @@ libraries.extend(extra_libs)
 
 ext_modules = [
     Extension(
-        "ibsimu",
+        "ibsimu._core",
         ["python/ibsimu_py.cpp"],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
@@ -91,6 +91,6 @@ setup(
     version="1.0.6",
     author="Taneli Kalvas",
     description="Python wrapper for IBSimu",
+    packages=["ibsimu"],
     ext_modules=ext_modules,
-    install_requires=["pybind11"],
 )

@@ -1,5 +1,6 @@
-import ibsimu
 import matplotlib.pyplot as plt
+
+import ibsimu
 
 
 def run_sector_magnet():
@@ -54,11 +55,8 @@ def run_sector_magnet():
 
     # Plot trajectories
     for i in range(pdb.size()):
-        p = pdb.particle(i)
-        tx, ty = [], []
-        for j in range(p.traj_size()):
-            tx.append(p.traj(j).x() * 1000)
-            ty.append(p.traj(j).y() * 1000)
+        traj = pdb.particle(i).trajectory() * 1000  # mm
+        tx, ty = traj[:, ibsimu.PARTICLE_X], traj[:, ibsimu.PARTICLE_Y]
         plt.plot(tx, ty, "b-", alpha=0.3)
 
     plt.title("Beam Deflection in a Sector Dipole Magnet")

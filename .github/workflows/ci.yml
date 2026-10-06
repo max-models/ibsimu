@@ -60,7 +60,7 @@ jobs:
     - name: Install Python dependencies and ibsimu
       run: |
         python -m pip install --upgrade pip
-        LDFLAGS="-L$(pwd)/src/.libs" pip install .
+        LDFLAGS="-L$(pwd)/src/.libs" pip install ".[dev]"
 
     - name: Run tests with pytest
       run: |

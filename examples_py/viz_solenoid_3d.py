@@ -1,8 +1,9 @@
 import math
 
-import ibsimu
 import numpy as np
 import pyvista as pv
+
+import ibsimu
 
 
 def run_solenoid_3d_viz():
@@ -45,11 +46,11 @@ def run_solenoid_3d_viz():
         ibsimu.Vec3D(0, -25e-3, -25e-3),
         h,
     )
-    for k in range(26):
-        for j in range(26):
-            for i in range(101):
-                x = i * h
-                bfield.set3(i, j, k, ibsimu.Vec3D(bx_cb(x, 0, 0), 0, 0))
+    # Fill the field from an (nx, ny, nz, 3) array: Bx depends on x only.
+    xs = bfield.node_coordinates()[0]
+    barr = np.zeros(bfield.shape() + (3,))
+    barr[..., 0] = np.array([bx_cb(x, 0, 0) for x in xs])[:, None, None]
+    bfield.set_numpy(barr)
 
     # 2. Particles
     pdb = ibsimu.ParticleDataBase3D(geom)
@@ -75,12 +76,10 @@ def run_solenoid_3d_viz():
     print("Opening interactive 3D Solenoid visualization...")
     trajectories = []
     for i in range(pdb.size()):
-        p = pdb.particle(i)
-        points = [
-            [p.traj(j).x(), p.traj(j).y(), p.traj(j).z()] for j in range(p.traj_size())
-        ]
+        traj = pdb.particle(i).trajectory()
+        points = traj[:, [ibsimu.PARTICLE_X, ibsimu.PARTICLE_Y, ibsimu.PARTICLE_Z]]
         if len(points) > 1:
-            trajectories.append(pv.MultipleLines(np.array(points)))
+            trajectories.append(pv.MultipleLines(points))
 
     plotter = pv.Plotter()
     for t in trajectories:
