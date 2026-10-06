@@ -1,5 +1,6 @@
-import ibsimu
 import matplotlib.pyplot as plt
+
+import ibsimu
 
 
 def run_sector_magnet():

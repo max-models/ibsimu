@@ -1,5 +1,6 @@
-import ibsimu
 import pyvista as pv
+
+import ibsimu
 
 
 def run_3d_quad_viz():

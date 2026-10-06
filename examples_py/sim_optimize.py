@@ -1,6 +1,7 @@
-import ibsimu
 import matplotlib.pyplot as plt
 import numpy as np
+
+import ibsimu
 
 # Diagnostic plane near the downstream end of the simulated beam line.
 X_TARGET = 195e-3

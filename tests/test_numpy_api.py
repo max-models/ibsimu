@@ -1,8 +1,9 @@
 """numpy interop, file loaders and exception mapping of the Python bindings."""
 
-import ibsimu
 import numpy as np
 import pytest
+
+import ibsimu
 
 
 @pytest.fixture(scope="module")

@@ -1,7 +1,8 @@
 """The cairo based plotters write image files from Python."""
 
-import ibsimu
 import pytest
+
+import ibsimu
 
 
 @pytest.fixture(scope="module")
