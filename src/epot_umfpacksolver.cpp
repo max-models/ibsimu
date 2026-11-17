@@ -52,8 +52,8 @@ EpotUMFPACKSolver::EpotUMFPACKSolver( Geometry &geom,
 				      double newton_step_eps, 
 				      uint32_t newton_imax,
 				      bool gnewton )
-    : EpotMatrixSolver(geom), _numeric(0), _gnewton(gnewton), _newton_r_eps(newton_r_eps), 
-      _newton_step_eps(newton_step_eps), _newton_imax(newton_imax)
+    : EpotMatrixSolver(geom), _numeric(0), _newton_res(0.0), _newton_step(0.0), _gnewton(gnewton),
+      _newton_r_eps(newton_r_eps), _newton_step_eps(newton_step_eps), _newton_imax(newton_imax)
 {
 
 }
