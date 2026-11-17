@@ -22,6 +22,10 @@
 #include "csgobject_solid.hpp"
 #endif
 #include "mydxffile.hpp"
+#include "mydxfentities.hpp"
+#include "mydxfblocks.hpp"
+#include "mydxftables.hpp"
+#include "stlfile.hpp"
 #include "transformation.hpp"
 #include "epot_solver.hpp"
 #include "epot_gssolver.hpp"
@@ -58,8 +62,7 @@
 #include "meshcolormap.hpp"
 #include "callback.hpp"
 #include "error.hpp"
-
-namespace py = pybind11;
+#include "ibsimu_py_common.hpp"
 
 // ---------------------------------------------------------------------------
 // Python errors raised inside callbacks
@@ -72,37 +75,23 @@ namespace py = pybind11;
 static std::mutex g_pyerr_mutex;
 static std::exception_ptr g_pyerr;
 
-static void store_python_error() {
+void store_python_error() {
     std::lock_guard<std::mutex> lock(g_pyerr_mutex);
     if (!g_pyerr) g_pyerr = std::current_exception();
 }
 
-static bool python_error_pending() {
+bool python_error_pending() {
     std::lock_guard<std::mutex> lock(g_pyerr_mutex);
     return (bool)g_pyerr;
 }
 
-static void rethrow_python_error() {
+void rethrow_python_error() {
     std::exception_ptr e;
     {
         std::lock_guard<std::mutex> lock(g_pyerr_mutex);
         std::swap(e, g_pyerr);
     }
     if (e) std::rethrow_exception(e);
-}
-
-// Run f() (which calls into Python) and park any exception it raises.
-template <typename R, typename F>
-static R guarded_call(R fallback, F f) {
-    if (python_error_pending()) return fallback;
-    try {
-        return f();
-    } catch (py::error_already_set &) {
-        store_python_error();
-    } catch (std::exception &) {
-        store_python_error();
-    }
-    return fallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +370,34 @@ static py::array_t<double> vector_to_numpy(const std::vector<double> &v) {
     return py::array_t<double>((py::ssize_t)v.size(), v.data());
 }
 
+// ---------------------------------------------------------------------------
+// BiCGSTAB analysis callbacks
+//
+// EpotBiCGSTABSolver stores plain void(*)(void) function pointers, so the
+// Python callables live in globals and a fixed C function forwards to them.
+// The solver runs with the GIL released; the callbacks take it back.
+// ---------------------------------------------------------------------------
+static py::object *g_bicgstab_cb[2] = { nullptr, nullptr };
+
+template <int I>
+static void bicgstab_cb_forward() {
+    py::gil_scoped_acquire gil;
+    guarded_call<int>(0, [&]{
+        if (g_bicgstab_cb[I] && !g_bicgstab_cb[I]->is_none()) (*g_bicgstab_cb[I])();
+        return 0;
+    });
+}
+
+static void set_bicgstab_callback(EpotBiCGSTABSolver &s, py::object f, bool nonlinear) {
+    const int i = nonlinear ? 1 : 0;
+    // Leaked on purpose: must outlive any solver, including at interpreter exit.
+    if (!g_bicgstab_cb[i]) g_bicgstab_cb[i] = new py::object();
+    *g_bicgstab_cb[i] = f;
+    void (*fwd)(void) = nonlinear ? &bicgstab_cb_forward<1> : &bicgstab_cb_forward<0>;
+    if (nonlinear) s.set_analysis_callback_nonlinear(f.is_none() ? nullptr : fwd);
+    else           s.set_analysis_callback(f.is_none() ? nullptr : fwd);
+}
+
 // ===========================================================================
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Python wrapper for IBSimu";
@@ -388,24 +405,57 @@ PYBIND11_MODULE(_core, m) {
     // -----------------------------------------------------------------------
     // Exceptions: map the library's Error hierarchy onto Python exceptions
     // -----------------------------------------------------------------------
+    // IBSimuError is the base of all library errors.  The subclasses also
+    // derive from the matching builtin exception, so `except IndexError`
+    // keeps catching ErrorRange.  The type objects are leaked on purpose:
+    // the translator may run until interpreter shutdown.
     static py::exception<Error> ibsimu_error(m, "IBSimuError", PyExc_RuntimeError);
+    static PyObject *err_types[6];
+    {
+        py::object type = py::module_::import("builtins").attr("type");
+        auto make = [&](const char *name, PyObject *builtin, const char *doc) {
+            py::dict ns;
+            ns["__doc__"] = doc;
+            ns["__module__"] = m.attr("__name__");
+            py::object t = type(name, py::make_tuple(ibsimu_error, py::handle(builtin)), ns);
+            m.attr(name) = t;
+            return t.release().ptr();
+        };
+        err_types[0] = make("IBSimuRangeError", PyExc_IndexError, "Index out of range (ErrorRange)");
+        err_types[1] = make("IBSimuDimError", PyExc_ValueError, "Dimension mismatch (ErrorDim)");
+        err_types[2] = make("IBSimuUnimplementedError", PyExc_NotImplementedError,
+                            "Feature not implemented (ErrorUnimplemented)");
+        err_types[3] = make("IBSimuNoMemError", PyExc_MemoryError, "Out of memory (ErrorNoMem)");
+        err_types[4] = make("IBSimuAssertError", PyExc_AssertionError, "Failed assertion (ErrorAssert)");
+        err_types[5] = make("IBSimuErrnoError", PyExc_OSError, "System call error (ErrorErrno)");
+    }
     py::register_exception_translator([](std::exception_ptr p) {
+        auto raise = [](PyObject *t, Error &e, const char *fallback) {
+            std::string msg = e.get_error_message();
+            if (msg.empty()) msg = fallback;
+            PyErr_SetString(t, msg.c_str());
+        };
         try {
             if (p) std::rethrow_exception(p);
         } catch (ErrorRange &e) {
-            PyErr_SetString(PyExc_IndexError, e.get_error_message().c_str());
+            raise(err_types[0], e, "Index out of range");
         } catch (ErrorDim &e) {
-            PyErr_SetString(PyExc_ValueError, e.get_error_message().c_str());
+            raise(err_types[1], e, "Dimension mismatch");
         } catch (ErrorUnimplemented &e) {
-            PyErr_SetString(PyExc_NotImplementedError, e.get_error_message().c_str());
+            raise(err_types[2], e, "Unimplemented");
         } catch (ErrorNoMem &e) {
-            PyErr_SetString(PyExc_MemoryError, e.get_error_message().c_str());
+            raise(err_types[3], e, "Out of memory");
+        } catch (ErrorAssert &e) {
+            raise(err_types[4], e, "Assertion failed");
+        } catch (ErrorErrno &e) {
+            raise(err_types[5], e, "System error");
         } catch (Error &e) {
-            std::string msg = e.get_error_message();
-            if (msg.empty()) msg = "IBSimu error";
-            ibsimu_error(msg.c_str());
+            raise(ibsimu_error.ptr(), e, "IBSimu error");
         }
     });
+
+    // Sparse matrices, vectors and preconditioners (ibsimu_py_linalg.cpp)
+    init_linalg(m);
 
     // -----------------------------------------------------------------------
     // Physical constants
@@ -600,6 +650,9 @@ PYBIND11_MODULE(_core, m) {
         .def("__truediv__", [](const Vec3D &a, double s){
             return Vec3D(a[0]/s, a[1]/s, a[2]/s); })
         .def("__neg__",  [](const Vec3D &a){ return -a; })
+        .def("min_element", &Vec3D::min_element, "Index of the component with the smallest absolute value")
+        .def("arb_perpendicular", &Vec3D::arb_perpendicular, "A unit vector perpendicular to this one")
+        .def_static("standard_basis", &Vec3D::standard_basis, py::arg("i"), "Unit vector along axis i")
         .def("__eq__",   [](const Vec3D &a, const Vec3D &b){ return a==b; })
         .def("__ne__",   [](const Vec3D &a, const Vec3D &b){ return a!=b; })
         .def("dot",      [](const Vec3D &a, const Vec3D &b){ return a*b; },
@@ -644,6 +697,7 @@ PYBIND11_MODULE(_core, m) {
         .def("__sub__",  [](const Vec4D &a, const Vec4D &b){ return a-b; })
         .def("__mul__",  [](const Vec4D &a, double s){ return a*s; })
         .def("dot",      [](const Vec4D &a, const Vec4D &b){ return a*b; })
+        .def("homogenize", &Vec4D::homogenize, "Divide all components by w (w becomes 1)")
         .def("norm2",    &Vec4D::norm2)
         .def("__repr__", [](const Vec4D &v){
             return "Vec4D(" + std::to_string(v[0]) + ", "
@@ -679,6 +733,8 @@ PYBIND11_MODULE(_core, m) {
         .def("inverse",     &Transformation::inverse)
         .def("transform",         &Transformation::transform)
         .def("transform_point",   &Transformation::transform_point)
+        .def("transform_homogenous_point", &Transformation::transform_homogenous_point, py::arg("x"),
+             "Transform point x to homogenous coordinates (no homogenization)")
         .def("inv_transform_point",&Transformation::inv_transform_point)
         .def("transform_vector",  &Transformation::transform_vector)
         .def("inv_transform_vector",&Transformation::inv_transform_vector)
@@ -814,6 +870,45 @@ PYBIND11_MODULE(_core, m) {
         .def("mesh_check1",    [](const Geometry &g, int32_t i){ return g.mesh_check(i); })
         .def("mesh_check2",    [](const Geometry &g, int32_t i, int32_t j){ return g.mesh_check(i,j); })
         .def("mesh_check3",    [](const Geometry &g, int32_t i, int32_t j, int32_t k){ return g.mesh_check(i,j,k); })
+        .def("mesh_check", [](const Geometry &g, int32_t i){ return g.mesh_check(i); }, py::arg("i"))
+        .def("mesh_check", [](const Geometry &g, int32_t i, int32_t j){ return g.mesh_check(i,j); },
+             py::arg("i"), py::arg("j"))
+        .def("mesh_check", [](const Geometry &g, int32_t i, int32_t j, int32_t k){ return g.mesh_check(i,j,k); },
+             py::arg("i"), py::arg("j"), py::arg("k"),
+             "Mesh value at node (i[, j[, k]]), or the boundary number for nodes outside the mesh")
+        .def("solid_dist", [](const Geometry &g, uint32_t i, uint32_t j, uint32_t k, uint32_t dir){
+            return g.solid_dist(i, j, k, dir);
+        }, py::arg("i"), py::arg("j"), py::arg("k"), py::arg("dir"),
+           "Distance (0-255 for 0.0-1.0 h) of the solid surface from near-solid node (i, j, k) in\n"
+           "direction dir (0 -x, 1 +x, 2 -y, 3 +y, 4 -z, 5 +z)")
+        .def("solid_dist_idx", [](const Geometry &g, uint32_t i, uint32_t dir){ return g.solid_dist(i, dir); },
+             py::arg("i"), py::arg("dir"), "solid_dist() with a one-dimensional node index")
+        .def("nearsolid_data", [](const Geometry &g, int32_t i, int32_t j, int32_t k){
+            // Decode the near-solid record of a node: flags byte and the stored distances.
+            if (!g.built()) throw std::runtime_error("Mesh not built");
+            if (i < 0 || j < 0 || k < 0 || i >= (int32_t)g.size(0) || j >= (int32_t)g.size(1) ||
+                k >= (int32_t)g.size(2))
+                throw py::index_error("Node outside the mesh");
+            uint32_t v = g.mesh(i, j, k);
+            if ((v & SMESH_NODE_ID_MASK & ~SMESH_NODE_FIXED) != SMESH_NODE_ID_NEAR_SOLID)
+                throw std::invalid_argument("Node is not a near-solid node");
+            const uint8_t *p = g.nearsolid_ptr(v & SMESH_NEAR_SOLID_INDEX_MASK);
+            py::dict d;
+            d["flags"] = (int)p[0];
+            py::list dist;
+            int n = 1;
+            for (int b = 0; b < 6; b++) {
+                if (p[0] & (1 << b)) dist.append(p[n++] / 255.0);
+                else dist.append(py::none());
+            }
+            d["dist"] = dist;
+            return d;
+        }, py::arg("i"), py::arg("j"), py::arg("k"),
+           "Near-solid record of node (i, j, k): flags byte and the parametric distances of the\n"
+           "solid surface in the directions -x, +x, -y, +y, -z, +z (None where no surface)")
+        .def("surface_inside", [](const Geometry &g, const Vec3D &x){
+            uint32_t r = g.surface_inside(x); rethrow_python_error(); return r;
+        }, py::arg("x"), "Like inside(), using the mesh and the surface triangulation (build_surface())")
         .def("is_near_solid",  &Geometry::is_near_solid)
         .def("mesh_numpy", [](py::object self){
             const Geometry &g = self.cast<const Geometry &>();
@@ -872,7 +967,14 @@ PYBIND11_MODULE(_core, m) {
        "Create a Solid whose inside() is defined by a Python callable f(x,y,z)->bool");
 
     py::class_<STLSolid, Solid>(m, "STLSolid")
+        .def(py::init<>())
         .def(py::init<const std::string &>())
+        .def("add_stl_file", [](STLSolid &s, py::object stl){
+            // The solid deletes its STL files, so Python gives up ownership.
+            s.add_stl_file(release_to_cpp<STLFile>(stl));
+        }, py::keep_alive<1, 2>(), py::arg("stl"), "Add an STLFile; the solid takes ownership")
+        .def("get_stl_file", &STLSolid::get_stl_file, py::arg("i") = 0,
+             py::return_value_policy::reference_internal)
         .def("inside",    &STLSolid::inside)
         .def("save",      [](const STLSolid &s, const std::string &fn){
             std::ofstream os(fn); s.save(os);
@@ -883,13 +985,21 @@ PYBIND11_MODULE(_core, m) {
         .def(py::init<const std::string &>())
         .def("read",  &MyDXFFile::read)
         .def("write", &MyDXFFile::write)
-        .def("set_warning_level", &MyDXFFile::set_warning_level);
+        .def("set_warning_level", &MyDXFFile::set_warning_level)
+        .def("wlevel", &MyDXFFile::wlevel)
+        .def("get_entities", (MyDXFEntities *(MyDXFFile::*)(void)) &MyDXFFile::get_entities,
+             py::return_value_policy::reference_internal)
+        .def("get_blocks", (MyDXFBlocks *(MyDXFFile::*)(void)) &MyDXFFile::get_blocks,
+             py::return_value_policy::reference_internal)
+        .def("get_tables", (MyDXFTables *(MyDXFFile::*)(void)) &MyDXFFile::get_tables,
+             py::return_value_policy::reference_internal)
+        .def("__str__", [](const MyDXFFile &f){ std::ostringstream os; f.debug_print(os); return os.str(); });
 
     py::class_<DXFSolid, Solid>(m, "DXFSolid")
         .def(py::init([](const std::string &filename){
             std::ifstream is(filename); return new DXFSolid(is);
         }))
-        .def(py::init<MyDXFFile*, const std::string &>())
+        .def(py::init<MyDXFFile*, const std::string &>(), py::keep_alive<1, 2>(), py::arg("dxf"), py::arg("layer"))
         .def("inside",    &DXFSolid::inside)
         .def("define_2x3_mapping", [](DXFSolid &s, const std::string &mname){
             if(mname == "unity") s.define_2x3_mapping(DXFSolid::unity);
@@ -1150,6 +1260,10 @@ PYBIND11_MODULE(_core, m) {
         .def("set_initial_plasma",&EpotSolver::set_initial_plasma, py::keep_alive<1, 3>())
         .def("set_forced_potential_volume", (void (EpotSolver::*)(double, CallbackFunctorB_V*)) &EpotSolver::set_forced_potential_volume, py::keep_alive<1, 3>())
         .def("set_forced_potential_volume_func", (void (EpotSolver::*)(CallbackFunctorD_V*)) &EpotSolver::set_forced_potential_volume, py::keep_alive<1, 2>())
+        .def("set_nsimp_initial_plasma", &EpotSolver::set_nsimp_initial_plasma, py::keep_alive<1, 2>(),
+             py::arg("init_plasma_func"), "Region of the initial plasma for the nsimp (negative ion) model")
+        .def("set_parameters", &EpotSolver::set_parameters, py::arg("epsolver"),
+             "Copy the plasma parameters from another solver")
         .def("set_plasma_calc_region", &EpotSolver::set_plasma_calc_region)
         .def("linear",            &EpotSolver::linear)
         .def("geometry", &EpotSolver::geometry, py::return_value_policy::reference);
@@ -1177,7 +1291,17 @@ PYBIND11_MODULE(_core, m) {
         .def("set_levels", &EpotMGSolver::set_levels, py::arg("levels"))
         .def("set_npre",   &EpotMGSolver::set_npre, py::arg("npre"))
         .def("set_npost",  &EpotMGSolver::set_npost, py::arg("npost"))
-        .def("set_gamma",  &EpotMGSolver::set_gamma, py::arg("gamma"));
+        .def("set_gamma",  &EpotMGSolver::set_gamma, py::arg("gamma"))
+        .def("set_w",      &EpotMGSolver::set_w, py::arg("w"))
+        .def("set_local_imax", &EpotMGSolver::set_local_imax, py::arg("local_imax"),
+             "Maximum number of local Newton iterations in the nonlinear smoother")
+        .def("set_mgcycmax", &EpotMGSolver::set_mgcycmax, py::arg("mgcyc"),
+             "Maximum number of multigrid cycles")
+        .def("set_mgeps",  &EpotMGSolver::set_mgeps, py::arg("mgeps"),
+             "Convergence criterion of the multigrid cycles")
+        .def("get_mgcyc",  &EpotMGSolver::get_mgcyc, "Number of multigrid cycles of the last solve")
+        .def("get_potential_change_norm", &EpotMGSolver::get_potential_change_norm)
+        .def("get_error_estimate", &EpotMGSolver::get_error_estimate);
 
     // EpotMatrixSolver intermediate base (needed for BiCGSTAB / UMFPACK)
     py::class_<EpotMatrixSolver, EpotSolver>(m, "EpotMatrixSolver");
@@ -1186,14 +1310,45 @@ PYBIND11_MODULE(_core, m) {
     // EpotBiCGSTABSolver
     // -----------------------------------------------------------------------
     py::class_<EpotBiCGSTABSolver, EpotMatrixSolver>(m, "EpotBiCGSTABSolver")
-        .def(py::init<Geometry &>())
+        .def(py::init<Geometry &, double, uint32_t, double, uint32_t, bool>(), py::arg("geom"),
+             py::arg("eps") = 1.0e-4, py::arg("imax") = 10000, py::arg("newton_eps") = 1.0e-4,
+             py::arg("newton_imax") = 10, py::arg("gnewton") = true)
         .def("set_eps",  &EpotBiCGSTABSolver::set_eps, py::arg("eps"))
-        .def("set_imax", &EpotBiCGSTABSolver::set_imax, py::arg("imax"));
+        .def("set_imax", &EpotBiCGSTABSolver::set_imax, py::arg("imax"))
+        .def("set_preconditioner", &EpotBiCGSTABSolver::set_preconditioner, py::arg("pc"),
+             "Use a copy of preconditioner pc (ILU0_Precond by default)")
+        .def("set_gnewton", &EpotBiCGSTABSolver::set_gnewton, py::arg("enable"),
+             "Use the global Newton-Raphson method for the nonlinear plasma problem")
+        .def("set_newton_imax", &EpotBiCGSTABSolver::set_newton_imax, py::arg("newton_imax"))
+        .def("set_newton_eps",  &EpotBiCGSTABSolver::set_newton_eps, py::arg("eps"))
+        .def("get_newton_residual",      &EpotBiCGSTABSolver::get_newton_residual)
+        .def("get_newton_residual_norm", &EpotBiCGSTABSolver::get_newton_residual_norm)
+        .def("get_newton_step",          &EpotBiCGSTABSolver::get_newton_step)
+        .def("get_newton_step_norm",     &EpotBiCGSTABSolver::get_newton_step_norm)
+        .def("get_scaled_residual",      &EpotBiCGSTABSolver::get_scaled_residual)
+        .def("get_error_estimate",       &EpotBiCGSTABSolver::get_error_estimate)
+        .def("get_iter",                 &EpotBiCGSTABSolver::get_iter)
+        .def("set_analysis_callback", [](EpotBiCGSTABSolver &s, py::object f){
+            set_bicgstab_callback(s, f, false);
+        }, py::arg("func"),
+           "Call func() after each BiCGSTAB iteration (None to remove). The library stores a plain\n"
+           "function pointer, so the most recently registered callback is shared by all solvers.")
+        .def("set_analysis_callback_nonlinear", [](EpotBiCGSTABSolver &s, py::object f){
+            set_bicgstab_callback(s, f, true);
+        }, py::arg("func"), "Call func() after each Newton iteration (None to remove); shared like set_analysis_callback");
 
 #ifdef HAVE_LIBUMFPACK
     // EpotUMFPACKSolver (only available when UMFPACK is installed)
     py::class_<EpotUMFPACKSolver, EpotMatrixSolver>(m, "EpotUMFPACKSolver")
-        .def(py::init<Geometry &>());
+        .def(py::init<Geometry &, double, double, uint32_t, bool>(), py::arg("geom"),
+             py::arg("newton_r_eps") = 1.0e-5, py::arg("newton_step_eps") = 1.0e-6,
+             py::arg("newton_imax") = 10, py::arg("gnewton") = true)
+        .def("set_newton_imax", &EpotUMFPACKSolver::set_newton_imax, py::arg("newton_imax"))
+        .def("set_gnewton", &EpotUMFPACKSolver::set_gnewton, py::arg("enable"))
+        .def("set_newton_residual_eps", &EpotUMFPACKSolver::set_newton_residual_eps, py::arg("eps"))
+        .def("set_newton_step_eps", &EpotUMFPACKSolver::set_newton_step_eps, py::arg("eps"))
+        .def("get_newton_residual", &EpotUMFPACKSolver::get_newton_residual)
+        .def("get_newton_step", &EpotUMFPACKSolver::get_newton_step);
 #endif
 
     // -----------------------------------------------------------------------
@@ -1233,7 +1388,17 @@ PYBIND11_MODULE(_core, m) {
         .def("x",  [](const ParticleP2D &p){ return p(PARTICLE_X); })
         .def("vx", [](const ParticleP2D &p){ return p(PARTICLE_VX); })
         .def("y",  [](const ParticleP2D &p){ return p(PARTICLE_Y); })
-        .def("vy", [](const ParticleP2D &p){ return p(PARTICLE_VY); });
+        .def("vy", [](const ParticleP2D &p){ return p(PARTICLE_VY); })
+        .def("speed", [](ParticleP2D &p){ return p.speed(); })
+        .def_static("dim", &ParticleP2D::dim, "Number of spatial dimensions")
+        .def_static("trajectory_intersections_at_plane", [](int crd, double val, const ParticleP2D &x1,
+                                                           const ParticleP2D &x2, int extrapolate){
+            std::vector<ParticleP2D> intsc;
+            ParticleP2D::trajectory_intersections_at_plane(intsc, crd, val, x1, x2, extrapolate);
+            return intsc;
+        }, py::arg("crd"), py::arg("val"), py::arg("x1"), py::arg("x2"), py::arg("extrapolate") = 0,
+           "Intersections of the trajectory segment x1 -> x2 with the plane where spatial axis crd\n"
+           "(0 = x, 1 = y or r, 2 = z) equals val, along the cubic trajectory interpolation");
 
     // -----------------------------------------------------------------------
     // ParticlePCyl
@@ -1250,7 +1415,17 @@ PYBIND11_MODULE(_core, m) {
         .def("vx", [](const ParticlePCyl &p){ return p(PARTICLE_VX); })
         .def("r",  [](const ParticlePCyl &p){ return p(PARTICLE_R); })
         .def("vr", [](const ParticlePCyl &p){ return p(PARTICLE_VR); })
-        .def("w",  [](const ParticlePCyl &p){ return p(PARTICLE_W); });
+        .def("w",  [](const ParticlePCyl &p){ return p(PARTICLE_W); })
+        .def("speed", [](ParticlePCyl &p){ return p.speed(); })
+        .def_static("dim", &ParticlePCyl::dim, "Number of spatial dimensions")
+        .def_static("trajectory_intersections_at_plane", [](int crd, double val, const ParticlePCyl &x1,
+                                                           const ParticlePCyl &x2, int extrapolate){
+            std::vector<ParticlePCyl> intsc;
+            ParticlePCyl::trajectory_intersections_at_plane(intsc, crd, val, x1, x2, extrapolate);
+            return intsc;
+        }, py::arg("crd"), py::arg("val"), py::arg("x1"), py::arg("x2"), py::arg("extrapolate") = 0,
+           "Intersections of the trajectory segment x1 -> x2 with the plane where spatial axis crd\n"
+           "(0 = x, 1 = y or r, 2 = z) equals val, along the cubic trajectory interpolation");
 
     // -----------------------------------------------------------------------
     // ParticleP3D
@@ -1268,7 +1443,17 @@ PYBIND11_MODULE(_core, m) {
         .def("y",  [](const ParticleP3D &p){ return p(PARTICLE_Y); })
         .def("vy", [](const ParticleP3D &p){ return p(PARTICLE_VY); })
         .def("z",  [](const ParticleP3D &p){ return p(PARTICLE_Z); })
-        .def("vz", [](const ParticleP3D &p){ return p(PARTICLE_VZ); });
+        .def("vz", [](const ParticleP3D &p){ return p(PARTICLE_VZ); })
+        .def("speed", [](ParticleP3D &p){ return p.speed(); })
+        .def_static("dim", &ParticleP3D::dim, "Number of spatial dimensions")
+        .def_static("trajectory_intersections_at_plane", [](int crd, double val, const ParticleP3D &x1,
+                                                           const ParticleP3D &x2, int extrapolate){
+            std::vector<ParticleP3D> intsc;
+            ParticleP3D::trajectory_intersections_at_plane(intsc, crd, val, x1, x2, extrapolate);
+            return intsc;
+        }, py::arg("crd"), py::arg("val"), py::arg("x1"), py::arg("x2"), py::arg("extrapolate") = 0,
+           "Intersections of the trajectory segment x1 -> x2 with the plane where spatial axis crd\n"
+           "(0 = x, 1 = y or r, 2 = z) equals val, along the cubic trajectory interpolation");
 
     // -----------------------------------------------------------------------
     // ParticleBase
@@ -1453,6 +1638,10 @@ PYBIND11_MODULE(_core, m) {
         .def("n",    &Histogram1D::n)
         .def("step", &Histogram1D::step)
         .def("coord",&Histogram1D::coord)
+        .def("accumulate", [](Histogram1D &h, uint32_t i, double w){
+            if (i >= h.n()) throw py::index_error("Bin index out of range");
+            h.accumulate(i, w);
+        }, py::arg("i"), py::arg("weight")=1.0, "Add weight to bin i")
         .def("accumulate_closest", [](Histogram1D &h, double x, double w){ h.accumulate_closest(x,w); },
              py::arg("x"), py::arg("weight")=1.0)
         .def("accumulate_linear",  [](Histogram1D &h, double x, double w){ h.accumulate_linear(x,w); },
@@ -1494,6 +1683,10 @@ PYBIND11_MODULE(_core, m) {
         .def("mstep",  &Histogram2D::mstep)
         .def("icoord", &Histogram2D::icoord)
         .def("jcoord", &Histogram2D::jcoord)
+        .def("accumulate", [](Histogram2D &h, uint32_t i, uint32_t j, double w){
+            if (i >= h.n() || j >= h.m()) throw py::index_error("Bin index out of range");
+            h.accumulate(i, j, w);
+        }, py::arg("i"), py::arg("j"), py::arg("weight")=1.0, "Add weight to bin (i, j)")
         .def("accumulate_closest", [](Histogram2D &h, double x, double y, double w){
             h.accumulate_closest(x,y,w);
         })
@@ -1601,7 +1794,14 @@ PYBIND11_MODULE(_core, m) {
         .def("set_rng_type",          &IBSimu::set_rng_type, py::arg("type"))
         .def("inc_indent",            &IBSimu::inc_indent)
         .def("dec_indent",            &IBSimu::dec_indent)
-        .def("output_is_cout",        &IBSimu::output_is_cout);
+        .def("output_is_cout",        &IBSimu::output_is_cout)
+        .def("get_thread_count",      &IBSimu::get_thread_count)
+        .def("get_rng_type",          &IBSimu::get_rng_type)
+        .def("message", [](IBSimu &ib, const std::string &text, int32_t level, message_type_e type){
+            ib.message(type, level) << text;
+        }, py::arg("text"), py::arg("level") = 1, py::arg("type") = MSG_VERBOSE,
+           "Write text to the IBSimu message output (shown if level <= the threshold of type)")
+        .def("flush", &IBSimu::flush, py::arg("finishlines") = true);
 
     m.attr("ibsimu") = py::cast(&ibsimu, py::return_value_policy::reference);
 
@@ -1842,18 +2042,8 @@ PYBIND11_MODULE(_core, m) {
 #endif
         ;
 
-    py::class_<MeshColormap>(m, "MeshColormap")
-        .def("set_zscale", &MeshColormap::set_zscale, py::arg("zscale"))
-        .def("get_zscale", &MeshColormap::get_zscale)
-        .def("set_interpolation", &MeshColormap::set_interpolation, py::arg("interpolation"))
-        .def("get_interpolation", &MeshColormap::get_interpolation)
-        .def("set_zrange", &MeshColormap::set_zrange, py::arg("min"), py::arg("max"))
-        .def("get_zrange", [](const MeshColormap &c){
-            double mn, mx; c.get_zrange(mn, mx); return py::make_tuple(mn, mx);
-        });
-
-    py::class_<FieldGraph, MeshColormap>(m, "FieldGraph")
-        .def("set_zrange", &FieldGraph::set_zrange);
+    // Palettes, colormaps, graphs, Frame, Geom3DPlot, GTKPlotter (ibsimu_py_plotting.cpp)
+    init_plotting_extra(m);
 
     py::class_<GeomPlotter, Plotter>(m, "GeomPlotter")
         .def(py::init<const Geometry &>())
@@ -1955,4 +2145,9 @@ PYBIND11_MODULE(_core, m) {
     m.attr("PARTICLE_W")  = PARTICLE_W;
     m.attr("PARTICLE_Z")  = PARTICLE_Z;
     m.attr("PARTICLE_VZ") = PARTICLE_VZ;
+
+    // Triangulated surfaces, STL files and DXF contents (ibsimu_py_geometry.cpp)
+    init_geometry_extra(m);
+    // ASCII data files and space charge deposition (ibsimu_py_misc.cpp)
+    init_misc_extra(m);
 }

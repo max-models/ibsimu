@@ -101,6 +101,12 @@ void MeshColormap::clear_data( void )
 }
 
 
+bool MeshColormap::has_data( void ) const
+{
+    return( _n > 0 && _m > 0 );
+}
+
+
 void MeshColormap::set_data( const double datarange[4], size_t n, size_t m, 
 			 const std::vector<double> &data )
 {

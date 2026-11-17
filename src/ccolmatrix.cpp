@@ -370,7 +370,7 @@ void CColMatrix::clear( void )
 }
 
 
-inline void CColMatrix::clear_no_check( int i, int j )
+void CColMatrix::clear_no_check( int i, int j )
 {
     int a;
     /* Search for the element */
@@ -464,7 +464,7 @@ bool CColMatrix::check_ascending( void ) const
 }
 
 
-inline double CColMatrix::get_no_check( int i, int j ) const
+double CColMatrix::get_no_check( int i, int j ) const
 {
     for( int a = _ptr[j]; a < _ptr[j+1]; a++ )
 	if( _row[a] == i )
@@ -473,7 +473,7 @@ inline double CColMatrix::get_no_check( int i, int j ) const
 }
 
 
-inline double &CColMatrix::set_no_check( int i, int j )
+double &CColMatrix::set_no_check( int i, int j )
 {
     /* Use existing element if it exists */
     for( int a = _ptr[j]; a < _ptr[j+1]; a++ )

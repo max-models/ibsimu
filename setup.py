@@ -1,3 +1,4 @@
+import glob
 import os
 import subprocess
 import sys
@@ -34,7 +35,7 @@ def get_pkg_config_multi(flag, pkgs):
 
 # IBSimu specific flags
 # Since we are building in-tree, we add src/ to includes
-include_dirs = ["src", Pybind11Include()]
+include_dirs = ["src", "python", Pybind11Include()]
 library_dirs = ["src/.libs"]
 libraries = ["ibsimu-1.0.6dev"]
 extra_objects = []
@@ -76,12 +77,13 @@ libraries.extend(extra_libs)
 ext_modules = [
     Extension(
         "ibsimu._core",
-        ["python/ibsimu_py.cpp"],
+        sorted(glob.glob("python/ibsimu_py*.cpp")),
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         libraries=libraries,
         extra_objects=extra_objects,
         extra_compile_args=extra_compile_args,
+        depends=sorted(glob.glob("python/*.hpp")),
         language="c++",
     ),
 ]
