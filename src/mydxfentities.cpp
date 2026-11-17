@@ -714,6 +714,23 @@ void MyDXFEntities::translate( MyDXFEntitySelection *selection, class MyDXFFile 
 }
 
 
+void MyDXFEntities::rotate_z( MyDXFEntitySelection *selection, double a )
+{
+    if( selection ) {
+	// Go through selection
+	for( size_t b = 0; b < selection->size(); b++ ) {
+	    MyDXFEntity *e = _entities[(*selection)(b)];
+	    e->rotate_z( _dxf, a );
+	}
+    } else {
+	// Rotate all entities
+	for( size_t b = 0; b < _entities.size(); b++ ) {
+	    MyDXFEntity *e = _entities[b];
+	    e->rotate_z( _dxf, a );
+	}
+    }
+}
+
 
 void MyDXFEntities::remove( MyDXFEntitySelection *selection )
 {

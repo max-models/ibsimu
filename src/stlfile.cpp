@@ -330,6 +330,21 @@ STLFile::STLFile( const std::string &filename,
     ibsimu.dec_indent();
 }
 
+STLFile::STLFile( const std::vector<Vec3D> &vertex,
+		  const std::vector<VTriangle> &triangle )
+    : _ascii(false)
+{
+    for( size_t a = 0; a < triangle.size(); a++ ) {
+	for( size_t b = 0; b < 3; b++ ) {
+	    if( triangle[a][b] >= vertex.size() )
+		throw( ErrorRange( ERROR_LOCATION, triangle[a][b], vertex.size() ) );
+	}
+	_solid.add_triangle( vertex[triangle[a][0]], vertex[triangle[a][1]], vertex[triangle[a][2]] );
+    }
+    _solid.prepare_for_inside();
+    _solid.check_data();
+}
+
 
 STLFile::~STLFile()
 {

@@ -370,7 +370,7 @@ void CRowMatrix::clear( void )
 }
 
 
-inline void CRowMatrix::clear_no_check( int i, int j )
+void CRowMatrix::clear_no_check( int i, int j )
 {
     int a;
 
@@ -464,7 +464,7 @@ bool CRowMatrix::check_ascending( void ) const
 }
 
 
-inline double CRowMatrix::get_no_check( int i, int j ) const
+double CRowMatrix::get_no_check( int i, int j ) const
 {
     for( int a = _ptr[i]; a < _ptr[i+1]; a++ )
 	if( _col[a] == j )
@@ -473,7 +473,7 @@ inline double CRowMatrix::get_no_check( int i, int j ) const
 }
 
 
-inline double &CRowMatrix::set_no_check( int i, int j )
+double &CRowMatrix::set_no_check( int i, int j )
 {
     /* Use existing element if it exists */
     for( int a = _ptr[i]; a < _ptr[i+1]; a++ )

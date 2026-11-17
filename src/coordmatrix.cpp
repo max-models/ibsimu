@@ -344,7 +344,7 @@ void CoordMatrix::clear( void )
 }
 
 
-inline void CoordMatrix::clear_no_check( int i, int j )
+void CoordMatrix::clear_no_check( int i, int j )
 {
 
 }
@@ -426,7 +426,7 @@ void CoordMatrix::debug_print( std::ostream &os ) const
 }
 
 
-inline double CoordMatrix::get_no_check( int i, int j ) const
+double CoordMatrix::get_no_check( int i, int j ) const
 {
     for( int a = 0; a < _nz; a++ )
 	if( _row[a] == i && _col[a] == j  )
@@ -435,7 +435,7 @@ inline double CoordMatrix::get_no_check( int i, int j ) const
 }
 
 
-inline double &CoordMatrix::set_no_check( int i, int j )
+double &CoordMatrix::set_no_check( int i, int j )
 {
     /* Use existing element if it exists */
     for( int a = 0; a < _nz; a++ )
