@@ -217,7 +217,10 @@ class Simulation:
     Parameters
     ----------
     mode
-        Geometry mode: ``"2d"``, ``"cyl"``, ``"3d"`` or an ``ibsimu.MODE_*`` value.
+        Geometry mode: ``"1d"``, ``"2d"``, ``"cyl"``, ``"3d"`` or an ``ibsimu.MODE_*``
+        value. IBSimu traces no particles in 1D: a 1D simulation solves the potential
+        for the space charge given by ``scharge`` (and the plasma model), and takes
+        no ``beams``.
     size
         Number of mesh nodes per axis, e.g. ``(101, 41, 1)``.
     h
@@ -237,6 +240,10 @@ class Simulation:
         trajectory iteration. Each item is either ``{"method": name, **kwargs}``
         calling ``pdb.add_<name>(**kwargs)`` (the ``add_`` prefix is optional) or a
         callable ``f(pdb)``.
+    scharge
+        External space charge density [C/m^3] added to the beam space charge in every
+        iteration: a number, a callable ``f(x, y, z) -> rho`` evaluated at the mesh
+        nodes, or an array of the node shape (``Geometry.shape()``).
     bfield
         A ``VectorField`` (e.g. ``MeshVectorField``) used as the magnetic field.
     solver
@@ -244,7 +251,9 @@ class Simulation:
         solver class or a solver factory ``f(geom) -> EpotSolver``.
     solver_options
         ``{name: value}`` applied as ``solver.set_<name>(value)`` (tuples are
-        unpacked), e.g. ``{"eps": 1e-4, "imax": 10000}``.
+        unpacked), e.g. ``{"eps": 1e-4, "imax": 10000}``, ``{"mgcycmax": 50}`` for
+        multigrid or ``{"preconditioner": ibsimu.ILU1_Precond(), "newton_imax": 20}``
+        for BiCGSTAB.
     pdb_options
         Same for the particle database, e.g. ``{"max_steps": 10000, "polyint": True,
         "mirror": [False, False, True, False, False, False]}``. Trajectories are
@@ -277,6 +286,7 @@ class Simulation:
         solids: Mapping[int, Any] | None = None,
         boundaries: Mapping[int, Any] | None = None,
         beams: Sequence[Any] = (),
+        scharge: Any = None,
         bfield: _core.VectorField | None = None,
         solver: Any = "gs",
         solver_options: Mapping[str, Any] | None = None,
@@ -288,14 +298,19 @@ class Simulation:
         name: str = "",
     ):
         self.mode = _mode_of(mode)
-        if self.mode not in _PDB_CLASSES:
-            raise ValueError("Simulation supports the 2d, cyl and 3d geometry modes")
+        if self.mode not in _DIMS:
+            raise ValueError("Unknown geometry mode")
         self.size = tuple(int(n) for n in (list(size) + [1, 1])[:3])
         self.h = float(h)
         self.origo = tuple(float(v) for v in (list(origo) + [0.0, 0.0])[:3])
         self.solids = dict(solids or {})
         self.boundaries = dict(boundaries or {})
         self.beams = list(beams)
+        if self.mode not in _PDB_CLASSES and self.beams:
+            raise ValueError(
+                "IBSimu traces no particles in 1D: give the space charge with scharge= instead of beams"
+            )
+        self.scharge = scharge
         self.bfield = bfield
         self.solver = solver
         self.solver_options = dict(solver_options or {})
@@ -360,10 +375,34 @@ class Simulation:
             )
         return solver
 
-    def build_pdb(self, geom: _core.Geometry) -> _core.ParticleDataBase:
+    def build_pdb(self, geom: _core.Geometry) -> _core.ParticleDataBase | None:
+        """The particle database, or ``None`` in 1D (no particle tracing)."""
+        if self.mode not in _PDB_CLASSES:
+            return None
         pdb = _PDB_CLASSES[self.mode](geom)
         _apply_options(pdb, self.pdb_options, "particle database")
         return pdb
+
+    def external_scharge(self, geom: _core.Geometry) -> np.ndarray | None:
+        """The external space charge density on the mesh nodes, or ``None``."""
+        if self.scharge is None:
+            return None
+        shape = tuple(geom.shape())
+        if callable(self.scharge):
+            axes = geom.node_coordinates()
+            data = np.empty(shape)
+            for idx in np.ndindex(shape):
+                x = [axes[d][idx[d]] if d < len(idx) else 0.0 for d in range(3)]
+                data[idx] = float(self.scharge(*x))
+            return data
+        data = np.asarray(self.scharge, dtype=float)
+        if data.ndim == 0:
+            return np.full(shape, float(data))
+        if data.shape != shape:
+            raise ValueError(
+                f"scharge array has shape {data.shape}, the mesh nodes {shape}"
+            )
+        return data
 
     def add_beams(self, pdb: _core.ParticleDataBase) -> None:
         for beam in self.beams:
@@ -383,20 +422,29 @@ class Simulation:
                 raise ValueError(f"{type(pdb).__name__} has no beam method {name!r}")
             func(**spec)
 
+    @staticmethod
+    def _rhosum(pdb: _core.ParticleDataBase | None) -> float:
+        if pdb is None:
+            raise ValueError(
+                "In 1D the plasma model needs the beam space charge given explicitly "
+                "(rhoe for 'pexp', rhop for 'nsimp')"
+            )
+        return pdb.get_rhosum()
+
     def _apply_plasma(
-        self, solver: _core.EpotSolver, pdb: _core.ParticleDataBase
+        self, solver: _core.EpotSolver, pdb: _core.ParticleDataBase | None
     ) -> None:
         p = dict(self.plasma)
         kind = p.pop("kind")
         if kind == "pexp":
             rhoe = p.pop("rhoe", None)
             if rhoe is None:
-                rhoe = -pdb.get_rhosum()
+                rhoe = -self._rhosum(pdb)
             solver.set_pexp_plasma(float(rhoe), float(p.pop("Te")), float(p.pop("Up")))
         elif kind == "nsimp":
             rhop = p.pop("rhop", None)
             if rhop is None:
-                rhop = -pdb.get_rhosum()
+                rhop = -self._rhosum(pdb)
             solver.set_nsimp_plasma(
                 float(rhop),
                 float(p.pop("Ep")),
@@ -442,6 +490,9 @@ class Simulation:
             efield.set_extrapolation(list(self.efield_extrapolation))
         bfield = self.bfield if self.bfield is not None else _core.MeshVectorField()
         pdb = self.build_pdb(geom)
+        ext = self.external_scharge(geom)
+        if ext is not None:
+            scharge.numpy()[...] = ext
 
         out = SimulationOutput(
             self,
@@ -463,24 +514,27 @@ class Simulation:
                 self._apply_plasma(solver, pdb)
             solver.solve(epot, scharge)
             efield.recalculate()
-            pdb.clear()
-            self.add_beams(pdb)
-            pdb.iterate_trajectories(scharge, efield, bfield)
+            if pdb is not None:
+                pdb.clear()
+                self.add_beams(pdb)
+                pdb.iterate_trajectories(scharge, efield, bfield)
+                if ext is not None:
+                    scharge.numpy()[...] += ext
 
             e = epot.numpy()
             s = scharge.numpy()
-            stats = pdb.get_statistics()
+            stats = pdb.get_statistics() if pdb is not None else None
             record = {
                 "iteration": i,
-                "particles": pdb.size(),
+                "particles": pdb.size() if pdb is not None else 0,
                 "epot_change": float(np.max(np.abs(e - prev_epot)))
                 if prev_epot is not None
                 else float("nan"),
                 "scharge_change": float(np.max(np.abs(s - prev_scharge)))
                 if prev_scharge is not None
                 else float("nan"),
-                "collisions": int(stats.total_collisions()),
-                "current": float(stats.total_current()),
+                "collisions": int(stats.total_collisions()) if stats else 0,
+                "current": float(stats.total_current()) if stats else 0.0,
                 "wall_time": time.perf_counter() - ti,
             }
             prev_epot, prev_scharge = e.copy(), s.copy()
@@ -520,7 +574,7 @@ class SimulationOutput:
         geom,
         epot,
         scharge,
-        pdb,
+        pdb=None,
         solver=None,
         efield=None,
         bfield=None,
@@ -569,8 +623,16 @@ class SimulationOutput:
         return attrs
 
     def keys(self) -> tuple[str, ...]:
-        """Keys accepted by :meth:`evaluate`."""
+        """Keys accepted by :meth:`evaluate` (no particle data without a database)."""
+        if self.pdb is None:
+            return tuple(k for k in _FIELD_KEYS if k != "trajdens")
         return _KEYS
+
+    def _require_pdb(self, what: str) -> None:
+        if self.pdb is None:
+            raise KeyError(
+                f"{what} needs particle data, which this output has none of (1D)"
+            )
 
     def info(self) -> None:
         """Print a summary of the geometry, the run and the particle statistics."""
@@ -592,11 +654,12 @@ class SimulationOutput:
         lines.append(f"  potential    : {emin:.6g} .. {emax:.6g} V")
         smin, smax = self.scharge.get_minmax()
         lines.append(f"  space charge : {smin:.4g} .. {smax:.4g} C/m^3")
-        lines.append(
-            f"  particles    : {self.pdb.size()} (trajectories saved: {bool(self.pdb.get_save_trajectories())})"
-        )
-        stats = self.pdb.get_statistics()
-        nb = stats.number_of_boundaries()
+        if self.pdb is not None:
+            lines.append(
+                f"  particles    : {self.pdb.size()} (trajectories saved: {bool(self.pdb.get_save_trajectories())})"
+            )
+        stats = self.pdb.get_statistics() if self.pdb is not None else None
+        nb = stats.number_of_boundaries() if stats is not None else 0
         if nb:
             per_bound = ", ".join(
                 f"{b}: {stats.bound_collisions(b)} ({stats.bound_current(b):.4g} A)"
@@ -642,6 +705,8 @@ class SimulationOutput:
         """
         xr = _xarray()
         key = key.lower()
+        if key in ("trajectories", "markers", "trajdens"):
+            self._require_pdb(repr(key))
         if key == "trajectories":
             return self._trajectories(xr, **kwargs)
         if key == "markers":
@@ -730,6 +795,7 @@ class SimulationOutput:
         named after them (``DIAG_Y`` -> ``"y"``) and share the ``marker`` dimension.
         """
         xr = _xarray()
+        self._require_pdb("diagnostics()")
         diag = list(diagnostics)
         tdata = _core.TrajectoryDiagnosticData()
         self.pdb.trajectories_at_plane(tdata, axis, float(value), diag)
@@ -750,7 +816,8 @@ class SimulationOutput:
         self.geom.save(os.path.join(directory, "geom.dat"))
         self.epot.save(os.path.join(directory, "epot.dat"))
         self.scharge.save(os.path.join(directory, "scharge.dat"))
-        self.pdb.save(os.path.join(directory, "pdb.dat"))
+        if self.pdb is not None:
+            self.pdb.save(os.path.join(directory, "pdb.dat"))
         meta = {
             "name": self.name,
             "mode": _MODE_NAMES[self.mode],
@@ -769,7 +836,12 @@ class SimulationOutput:
         geom = _core.Geometry(os.path.join(directory, "geom.dat"))
         epot = _core.EpotField(os.path.join(directory, "epot.dat"), geom)
         scharge = _core.MeshScalarField(os.path.join(directory, "scharge.dat"))
-        pdb = _PDB_CLASSES[geom.geom_mode()](os.path.join(directory, "pdb.dat"), geom)
+        pdb_file = os.path.join(directory, "pdb.dat")
+        pdb = (
+            _PDB_CLASSES[geom.geom_mode()](pdb_file, geom)
+            if geom.geom_mode() in _PDB_CLASSES and os.path.exists(pdb_file)
+            else None
+        )
         out = cls(
             None,
             geom=geom,
